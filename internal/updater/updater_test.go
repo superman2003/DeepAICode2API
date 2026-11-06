@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -136,5 +137,89 @@ func TestUpdaterRejectsUntrustedOriginsAndDowngrades(t *testing.T) {
 	}
 	if !newer("v0.2.1", "v0.2.0") || newer("v0.1.9", "v0.2.0") || newer("v0.2.0", "0.2.0") {
 		t.Fatal("version downgrade/same-version handling is incorrect")
+	}
+}
+
+func TestAPIRateLimitFallsBackToFeedAndVerifiedDownload(t *testing.T) {
+	for _, validChecksum := range []bool{true, false} {
+		t.Run(fmt.Sprintf("valid-checksum-%v", validChecksum), func(t *testing.T) {
+			root := t.TempDir()
+			manager, err := New(root, filepath.Join(root, "data"), "v0.1.0", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			archive := fixtureArchive(t, "", false)
+			hash := sha256.Sum256(archive)
+			digest := hex.EncodeToString(hash[:])
+			if !validChecksum {
+				digest = strings.Repeat("0", 64)
+			}
+			base := "https://github.com/" + DefaultRepository
+			feed := `<feed xmlns="http://www.w3.org/2005/Atom"><entry><title>Stable release</title><link rel="alternate" href="` + base + `/releases/tag/v0.2.0"/></entry></feed>`
+			manager.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				status := http.StatusOK
+				var body []byte
+				switch req.URL.String() {
+				case "https://api.github.com/repos/" + DefaultRepository + "/releases/latest":
+					status = http.StatusForbidden
+				case base + "/releases.atom":
+					body = []byte(feed)
+				case base + "/releases/download/v0.2.0/SHA256SUMS.txt":
+					body = []byte(digest + "  " + AssetName + "\n")
+				case base + "/releases/download/v0.2.0/" + AssetName:
+					body = archive
+				default:
+					return nil, fmt.Errorf("unexpected URL: %s", req.URL)
+				}
+				return &http.Response{StatusCode: status, Body: io.NopCloser(bytes.NewReader(body)), Header: make(http.Header)}, nil
+			})
+			state, err := manager.Check(context.Background())
+			if err != nil || state.Phase != "available" || state.TargetVersion != "v0.2.0" {
+				t.Fatalf("check: %#v %v", state, err)
+			}
+			if err := manager.Prepare(); err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) {
+				state = manager.Status()
+				if state.Phase == "ready" || state.Phase == "failed" {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if validChecksum && state.Phase != "ready" {
+				t.Fatalf("valid feed download failed: %#v", state)
+			}
+			if !validChecksum && (state.Phase != "failed" || !strings.Contains(state.Error, "SHA256")) {
+				t.Fatalf("incorrect checksum accepted: %#v", state)
+			}
+		})
+	}
+}
+
+func TestFeedSelectsNewestStableReleaseFromExactRepository(t *testing.T) {
+	base := "https://github.com/" + DefaultRepository + "/releases/tag/"
+	feed := `<feed xmlns="http://www.w3.org/2005/Atom">`
+	for _, address := range []string{
+		base + "v0.2.0", base + "v1.0.0-beta.1", base + "v0.1.9", base + "v0.2.10", base + "v0.2.9",
+		"https://github.com/another/repository/releases/tag/v9.0.0",
+		"https://github.com.evil.example/" + DefaultRepository + "/releases/tag/v9.0.0",
+		base + "v9.0.0/extra", base + "v9.0.0?download=1", base + "v9.0.0#fragment",
+	} {
+		feed += `<entry><link rel="alternate" href="` + address + `"/></entry>`
+	}
+	feed += `</feed>`
+	release, err := releaseFromFeed(strings.NewReader(feed), DefaultRepository)
+	if err != nil || release.Tag != "v0.2.10" || len(release.Assets) != 2 {
+		t.Fatalf("selected release: %#v %v", release, err)
+	}
+	if (Asset{Size: 0}).validSize() || (Asset{Size: maxDownload + 1, sizeUnknown: true}).validSize() || !release.Assets[0].validSize() {
+		t.Fatal("unknown feed size weakened API size checks or download limit")
+	}
+	for _, invalid := range []string{`<feed`, `<feed xmlns="http://www.w3.org/2005/Atom"></feed>`, `<feed xmlns="https://evil.example"></feed>`} {
+		if _, err := releaseFromFeed(strings.NewReader(invalid), DefaultRepository); err == nil {
+			t.Fatal("accepted malformed or empty feed")
+		}
 	}
 }

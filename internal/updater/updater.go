@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -47,7 +48,14 @@ type Asset struct {
 	URL    string `json:"browser_download_url"`
 	Digest string `json:"digest"`
 	Size   int64  `json:"size"`
+	// Public release feeds do not publish asset sizes; downloads remain bounded.
+	sizeUnknown bool
 }
+
+func (a Asset) validSize() bool {
+	return (a.Size > 0 || (a.sizeUnknown && a.Size == 0)) && a.Size <= maxDownload
+}
+
 type Release struct {
 	Tag        string  `json:"tag_name"`
 	URL        string  `json:"html_url"`
@@ -253,18 +261,16 @@ func (m *Manager) Check(ctx context.Context) (State, error) {
 	repository := m.repository
 	m.mu.Unlock()
 	defer func() { m.mu.Lock(); m.busy = false; m.mu.Unlock() }()
-	resp, err := m.request(ctx, "https://api.github.com/repos/"+repository+"/releases/latest")
+	release, err := m.latestRelease(ctx, repository)
 	if err != nil {
 		return m.fail(err)
 	}
-	defer resp.Body.Close()
-	var release Release
-	if json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&release) != nil || release.Draft || release.Prerelease || !versionPattern.MatchString(release.Tag) {
+	if release.Draft || release.Prerelease || !versionPattern.MatchString(release.Tag) {
 		return m.fail(errors.New("Release 格式无效或不是稳定版本"))
 	}
 	var compatible bool
 	for _, asset := range release.Assets {
-		if asset.Name == AssetName && protectedAssetURL(asset.URL, repository) && asset.Size > 0 && asset.Size <= maxDownload {
+		if asset.Name == AssetName && protectedAssetURL(asset.URL, repository) && asset.validSize() {
 			compatible = true
 		}
 	}
@@ -282,6 +288,70 @@ func (m *Manager) Check(ctx context.Context) (State, error) {
 	state = m.state()
 	m.mu.Unlock()
 	return state, err
+}
+
+func (m *Manager) latestRelease(ctx context.Context, repository string) (Release, error) {
+	var release Release
+	resp, apiErr := m.request(ctx, "https://api.github.com/repos/"+repository+"/releases/latest")
+	if apiErr == nil {
+		apiErr = json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&release)
+		resp.Body.Close()
+		if apiErr == nil {
+			return release, nil
+		}
+	}
+	if ctx.Err() != nil {
+		return Release{}, ctx.Err()
+	}
+	// The public feed has a separate rate limit from the API and needs no token.
+	resp, err := m.request(ctx, "https://github.com/"+repository+"/releases.atom")
+	if err != nil {
+		return Release{}, fmt.Errorf("%v；Release Feed 备用检查失败：%w", apiErr, err)
+	}
+	defer resp.Body.Close()
+	return releaseFromFeed(io.LimitReader(resp.Body, 2<<20), repository)
+}
+
+func releaseFromFeed(reader io.Reader, repository string) (Release, error) {
+	var feed struct {
+		XMLName xml.Name `xml:"http://www.w3.org/2005/Atom feed"`
+		Entries []struct {
+			Title string `xml:"title"`
+			Links []struct {
+				Rel  string `xml:"rel,attr"`
+				Href string `xml:"href,attr"`
+			} `xml:"link"`
+		} `xml:"entry"`
+	}
+	if err := xml.NewDecoder(reader).Decode(&feed); err != nil {
+		return Release{}, errors.New("GitHub Release Feed 格式无效")
+	}
+	var release Release
+	prefix := "/" + repository + "/releases/tag/"
+	for _, entry := range feed.Entries {
+		for _, link := range entry.Links {
+			u, err := url.Parse(link.Href)
+			if err != nil || link.Rel != "alternate" || u.Scheme != "https" || u.Host != "github.com" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || !strings.HasPrefix(u.Path, prefix) {
+				continue
+			}
+			tag := strings.TrimPrefix(u.Path, prefix)
+			if !versionPattern.MatchString(tag) || strings.Contains(strings.SplitN(tag, "+", 2)[0], "-") || !newer(tag, "v0.0.0") {
+				continue
+			}
+			if release.Tag != "" && !newer(tag, release.Tag) {
+				continue
+			}
+			base := "https://github.com/" + repository + "/releases/download/" + url.PathEscape(tag) + "/"
+			release = Release{Tag: tag, URL: link.Href, Body: entry.Title, Assets: []Asset{
+				{Name: AssetName, URL: base + AssetName, sizeUnknown: true},
+				{Name: "SHA256SUMS.txt", URL: base + "SHA256SUMS.txt", sizeUnknown: true},
+			}}
+		}
+	}
+	if release.Tag == "" {
+		return Release{}, errors.New("GitHub Release Feed 中没有可用的稳定版本")
+	}
+	return release, nil
 }
 
 func (m *Manager) fail(err error) (State, error) {
@@ -321,7 +391,7 @@ func (m *Manager) prepare(ctx context.Context, release Release, repository strin
 			checksums = item
 		}
 	}
-	if !protectedAssetURL(asset.URL, repository) || asset.Size <= 0 || asset.Size > maxDownload {
+	if !protectedAssetURL(asset.URL, repository) || !asset.validSize() {
 		return errors.New("升级资源地址或大小无效")
 	}
 	expected := strings.TrimPrefix(asset.Digest, "sha256:")

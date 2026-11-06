@@ -20,6 +20,7 @@
 
 更新来源在页面保存到 `data/updater/config.json`，不需要改 `.env`。
 默认使用公开仓库，不需要 GitHub token。私有仓库的下载权限需要另行配置；本版本的浏览器下载资源面向公开 Release。
+从 `v0.2.1` 起，GitHub API 限流或无法连接时会自动尝试公开 Release Feed；备用通道仍须通过 SHA256 和包内清单校验，不需要修改 `.env`。
 直接运行裸 exe、`-Once` 模式或旧启动器不能执行网页重启，页面会明确提示使用新版启动器。
 
 下载只接受 GitHub HTTPS Release 资源；不接受网页提交任意下载 URL。
@@ -28,7 +29,7 @@ ZIP 解压仅允许专用清单和两个程序路径，拒绝目录穿越、符�
 
 ## 后续发布
 
-修改并提交代码，创建新版本 tag，例如 `v0.2.1` 后推送 tag。
+修改并提交代码，创建新版本 tag，例如 `v0.2.2` 后推送 tag。
 仓库的 `Windows release` 工作流会测试、编译并发布：
 
 - `DeepAICode2API_windows_amd64.zip`：首次安装或启动器协议变更时使用的完整无账号包。
@@ -38,7 +39,7 @@ ZIP 解压仅允许专用清单和两个程序路径，拒绝目录穿越、符�
 也可手动执行工作流，填写版本号；或在 Windows 本地执行：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1 -Version v0.2.1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1 -Version v0.2.2
 ```
 
 保持 `update-manifest.json` 的 protocol=1，且程序继续支持 `-check-state`、`/health` 的版本号和更新退出码 75。
