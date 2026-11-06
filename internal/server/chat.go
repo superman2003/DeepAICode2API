@@ -181,9 +181,7 @@ func (s *Server) streamChat(w http.ResponseWriter, body io.Reader, publicModel, 
 			return true
 		}
 		transformChatChunk(chunk, publicModel)
-		if u := parseUsage(chunk["usage"]); u.TotalTokens > 0 || u.Cost > 0 {
-			usage = u
-		}
+		usage = mergeStreamUsage(usage, chunk["usage"])
 		outLen += chatTextLen(chunk)
 		if raw := jsonEvent(chunk); raw != nil {
 			sw.data(raw)

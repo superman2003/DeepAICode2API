@@ -221,6 +221,21 @@ func Merge(old, new *Record) *Record {
 	if out.Fingerprint == "" {
 		out.Fingerprint = old.Fingerprint
 	}
+	if out.MachineID == "" {
+		out.MachineID = old.MachineID
+	}
+	if out.UserAgent == "" {
+		out.UserAgent = old.UserAgent
+	}
+	if out.AcceptLanguage == "" {
+		out.AcceptLanguage = old.AcceptLanguage
+	}
+	if out.SecCHUA == "" {
+		out.SecCHUA = old.SecCHUA
+	}
+	if out.Platform == "" {
+		out.Platform = old.Platform
+	}
 	if out.Stages == nil {
 		out.Stages = map[string]string{}
 	}
@@ -330,6 +345,23 @@ func mergeRecord(dst, src *Record) {
 	}
 	if src.Fingerprint != "" {
 		dst.Fingerprint = src.Fingerprint
+	}
+	// Fill absent metadata without replacing the identity already recorded for
+	// this account. Progress-only updates often omit these fields.
+	if dst.MachineID == "" {
+		dst.MachineID = src.MachineID
+	}
+	if dst.UserAgent == "" {
+		dst.UserAgent = src.UserAgent
+	}
+	if dst.AcceptLanguage == "" {
+		dst.AcceptLanguage = src.AcceptLanguage
+	}
+	if dst.SecCHUA == "" {
+		dst.SecCHUA = src.SecCHUA
+	}
+	if dst.Platform == "" {
+		dst.Platform = src.Platform
 	}
 	if src.Group != "" {
 		dst.Group = src.Group

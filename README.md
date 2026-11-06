@@ -1,14 +1,18 @@
 # DeepAICode2API
 
+本仓库在 [原项目](https://github.com/2951461586/DeepAICode2API) 基础上增加 TempMail.lol、QQ IMAP、Claude Code/Codex 缓存兼容、会话账号绑定及网页 Release 更新。
+Windows 可运行包不带任何账号或真实密钥，无需安装 Go。首次运行 `run-windows.cmd`，后续在管理网页“更新”中下载、校验并重启升级。
+详见 [网页更新说明](docs/web-update.md) 和 [最新 Release](https://github.com/superman2003/DeepAICode2API/releases/latest)。
+
 [![ci](https://github.com/2951461586/DeepAICode2API/actions/workflows/ci.yml/badge.svg)](https://github.com/2951461586/DeepAICode2API/actions/workflows/ci.yml)
-[![Go](https://img.shields.io/badge/Go-1.24-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 把本机 **DeepAI Code 桌面端**的上游模型服务，逆向复刻成一个
 **OpenAI / Anthropic 双协议兼容的 Go 网关**。
 
-复用桌面端登录后写入的 API Key，无需另申请密钥；纯 Go 标准库实现，
-单文件约 10 MB，零外部依赖。
+复用桌面端登录后写入的 API Key，无需另申请密钥；Go 实现，
+编译后为单文件程序。QQ IMAP 收信使用 go-imap / go-message，运行时无需额外服务进程。
 
 | 能力 | 说明 |
 | --- | --- |
@@ -352,8 +356,13 @@ go run ./cmd/probe -key <api-key>         # 直接验证某个 Key
 | `cf` | 建邮箱 + 收信 + 自动点验证链接 | `TEMPMAIL_BASE` / `TEMPMAIL_ADMIN_KEY` / `TEMPMAIL_DOMAIN` |
 | `static` | 随机前缀 `@域名`，无收件箱（跳过验证） | `DEEPAI_REGISTER_DOMAIN` |
 | `none` | 使用 `-email` 指定的固定邮箱 | 显式 `-email` |
+| `qqimap` | 域名随机地址 + QQ IMAP 收信验证 | `DEEPAI_REGISTER_DOMAIN` / `QQ_IMAP_USER` / `QQ_IMAP_AUTH_CODE` |
+| `tempmail_lol` | 外部临时邮箱创建 + 收信验证 | `TEMPMAIL_LOL_API_KEY`（可选） |
 
-留空自动选择：配置了 CF 就用 `cf`，否则有域名就用 `static`，否则 `none`。
+留空自动选择：`cf` → `qqimap` → `tempmail_lol` → `static` → `none`，使用第一个已配置的后端。
+
+域名邮箱转发到 QQ 收信的设置步骤、页面配置和 CLI 示例见 [QQ IMAP 配置](docs/qq-imap.md)。
+外部临时邮箱接入见 [TempMail.lol 配置](docs/tempmail-lol.md)。
 
 ### 6.6 台账与交付物
 

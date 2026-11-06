@@ -373,14 +373,19 @@ func (p *Pipeline) applyVerify(ctx context.Context, rec *Record, web *WebClient,
 		p.logf("[%s] 邮箱后端无收件箱，跳过邮件验证", rec.Email)
 	case out.err != nil:
 		rec.Mark("verify", "warning", out.waited)
+		rec.LastError = "邮箱验证未完成: " + out.err.Error()
 		p.logf("[%s] 等待验证邮件失败：%v", rec.Email, out.err)
 	default:
 		if err := verifyEmailThrottled(ctx, web, out.link); err != nil {
 			rec.Mark("verify", "warning", out.waited+time.Since(vt))
+			rec.LastError = "验证链接访问失败: " + err.Error()
 			p.logf("[%s] 验证链接访问失败：%v", rec.Email, err)
 			return false
 		}
 		rec.EmailVerified = true
+		if strings.HasPrefix(rec.LastError, "邮箱验证未完成:") || strings.HasPrefix(rec.LastError, "验证链接访问失败:") {
+			rec.LastError = ""
+		}
 		if StatusRank(rec.Status) < StatusRank(StatusVerified) {
 			rec.Status = StatusVerified
 		}
@@ -422,17 +427,14 @@ func (p *Pipeline) verifyBackfill(rec *Record, web *WebClient, ch chan verifyOut
 	case <-ctx.Done():
 		return
 	}
-	if !p.applyVerify(ctx, cp, web, out) {
-		return
-	}
-
-	if vm, ok := p.opts.Enroller.(VerifiedMarker); ok {
+	verified := p.applyVerify(ctx, cp, web, out)
+	if vm, ok := p.opts.Enroller.(VerifiedMarker); ok && verified {
 		if err := vm.MarkVerified(ctx, cp.AccountID, cp.Email); err != nil {
 			p.logf("[%s] 回填验证状态失败：%v", cp.Email, err)
 		}
 	}
 
-	// 再写一条台账：Merge 保留更高等级，并把 verify 从 pending 更新为 ok。
+	// Persist and publish both success and failure so the UI never stays pending after a timeout.
 	if p.opts.Ledger != nil {
 		_ = p.opts.Ledger.Append(cp)
 	}

@@ -40,31 +40,35 @@ type Settings struct {
 
 // LogEntry 是一条请求日志（只记元信息，不落对话内容）。
 type LogEntry struct {
-	Time      int64   `json:"time"`
-	Key       string  `json:"key"`
-	Account   string  `json:"account"`
-	Model     string  `json:"model"`
-	Endpoint  string  `json:"endpoint"`
-	Stream    bool    `json:"stream"`
-	Status    int     `json:"status"`
-	LatencyMS int64   `json:"latency_ms"`
-	PromptLen int     `json:"prompt_len"`
-	OutputLen int     `json:"output_len"`
-	TokensIn  int     `json:"tokens_in"`
-	TokensOut int     `json:"tokens_out"`
-	Cost      float64 `json:"cost"`
-	Err       string  `json:"err,omitempty"`
+	Time                int64   `json:"time"`
+	Key                 string  `json:"key"`
+	Account             string  `json:"account"`
+	Model               string  `json:"model"`
+	Endpoint            string  `json:"endpoint"`
+	Stream              bool    `json:"stream"`
+	Status              int     `json:"status"`
+	LatencyMS           int64   `json:"latency_ms"`
+	PromptLen           int     `json:"prompt_len"`
+	OutputLen           int     `json:"output_len"`
+	TokensIn            int     `json:"tokens_in"`
+	TokensOut           int     `json:"tokens_out"`
+	CacheReadTokens     int     `json:"cache_read_tokens,omitempty"`
+	CacheCreationTokens int     `json:"cache_creation_tokens,omitempty"`
+	Cost                float64 `json:"cost"`
+	Err                 string  `json:"err,omitempty"`
 }
 
 // Stats 是累计统计。
 type Stats struct {
-	TotalRequests  int64   `json:"total_requests"`
-	FailedRequests int64   `json:"failed_requests"`
-	TotalCharsOut  int64   `json:"total_chars_out"`
-	TotalTokensIn  int64   `json:"total_tokens_in"`
-	TotalTokensOut int64   `json:"total_tokens_out"`
-	TotalCost      float64 `json:"total_cost"`
-	StartedAt      int64   `json:"started_at"`
+	TotalRequests            int64   `json:"total_requests"`
+	FailedRequests           int64   `json:"failed_requests"`
+	TotalCharsOut            int64   `json:"total_chars_out"`
+	TotalTokensIn            int64   `json:"total_tokens_in"`
+	TotalTokensOut           int64   `json:"total_tokens_out"`
+	TotalCacheReadTokens     int64   `json:"total_cache_read_tokens"`
+	TotalCacheCreationTokens int64   `json:"total_cache_creation_tokens"`
+	TotalCost                float64 `json:"total_cost"`
+	StartedAt                int64   `json:"started_at"`
 }
 
 // State 是全部持久化状态。
@@ -690,6 +694,8 @@ func (s *Store) Record(e LogEntry, outChars int) {
 	}
 	s.st.Stats.TotalCharsOut += int64(outChars)
 	s.st.Stats.TotalTokensIn += int64(e.TokensIn)
+	s.st.Stats.TotalCacheReadTokens += int64(e.CacheReadTokens)
+	s.st.Stats.TotalCacheCreationTokens += int64(e.CacheCreationTokens)
 	s.st.Stats.TotalTokensOut += int64(e.TokensOut)
 	s.st.Stats.TotalCost += e.Cost
 	s.st.Logs = append(s.st.Logs, e)

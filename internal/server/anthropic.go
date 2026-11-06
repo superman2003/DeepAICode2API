@@ -15,19 +15,21 @@ import (
 // --- Anthropic 请求模型 ---
 
 type anthropicRequest struct {
-	Model         string             `json:"model"`
-	MaxTokens     int                `json:"max_tokens"`
-	System        json.RawMessage    `json:"system"`
-	Messages      []anthropicMessage `json:"messages"`
-	Stream        bool               `json:"stream"`
-	Temperature   *float64           `json:"temperature"`
-	TopP          *float64           `json:"top_p"`
-	TopK          *int               `json:"top_k"`
-	StopSequences []string           `json:"stop_sequences"`
-	Tools         []anthropicTool    `json:"tools"`
-	ToolChoice    json.RawMessage    `json:"tool_choice"`
-	Thinking      json.RawMessage    `json:"thinking"`
-	Metadata      json.RawMessage    `json:"metadata"`
+	Model          string             `json:"model"`
+	MaxTokens      int                `json:"max_tokens"`
+	System         json.RawMessage    `json:"system"`
+	Messages       []anthropicMessage `json:"messages"`
+	Stream         bool               `json:"stream"`
+	Temperature    *float64           `json:"temperature"`
+	TopP           *float64           `json:"top_p"`
+	TopK           *int               `json:"top_k"`
+	StopSequences  []string           `json:"stop_sequences"`
+	Tools          []anthropicTool    `json:"tools"`
+	ToolChoice     json.RawMessage    `json:"tool_choice"`
+	Thinking       json.RawMessage    `json:"thinking"`
+	Metadata       json.RawMessage    `json:"metadata"`
+	CacheControl   json.RawMessage    `json:"cache_control"`
+	PromptCacheKey string             `json:"prompt_cache_key"`
 }
 
 type anthropicMessage struct {
@@ -36,9 +38,10 @@ type anthropicMessage struct {
 }
 
 type anthropicTool struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description"`
-	InputSchema json.RawMessage `json:"input_schema"`
+	Name         string          `json:"name"`
+	Description  string          `json:"description"`
+	InputSchema  json.RawMessage `json:"input_schema"`
+	CacheControl json.RawMessage `json:"cache_control"`
 }
 
 // handleAnthropicMessages 是 POST /v1/messages 的入口。
@@ -73,7 +76,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	affinity := affinityFor(r, nil)
+	affinity := prepareClientCache(r, payload, "claude", req.Metadata, anthropicHasCacheControl(&req))
 	key := extractKey(r)
 	promptLen := estimatePromptLen(payload)
 
@@ -136,7 +139,7 @@ func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, payload
 		"message": map[string]any{
 			"id": msgID, "type": "message", "role": "assistant", "model": publicModel,
 			"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
-			"usage": map[string]any{"input_tokens": 0, "output_tokens": 0},
+			"usage": anthropicUsage(Usage{}),
 		},
 	})
 
@@ -161,9 +164,7 @@ func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, payload
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			return true
 		}
-		if u := parseUsage(chunk["usage"]); u.TotalTokens > 0 || u.Cost > 0 {
-			usage = u
-		}
+		usage = mergeStreamUsage(usage, chunk["usage"])
 		choices, _ := chunk["choices"].([]any)
 		if len(choices) == 0 {
 			return true
@@ -219,13 +220,11 @@ func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, payload
 	if outputTokens == 0 {
 		outputTokens = estTokens(outLen)
 	}
+	usage.CompletionTokens = outputTokens
 	send("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
-		"usage": map[string]any{
-			"input_tokens":  usage.PromptTokens,
-			"output_tokens": outputTokens,
-		},
+		"usage": anthropicUsage(usage),
 	})
 	send("message_stop", map[string]any{"type": "message_stop"})
 
@@ -282,9 +281,18 @@ func anthropicToChatPayload(req *anthropicRequest, modelID string) (map[string]a
 	if len(req.StopSequences) > 0 {
 		payload["stop"] = req.StopSequences
 	}
+	if req.Stream {
+		payload["stream_options"] = map[string]any{"include_usage": true}
+	}
+	if req.PromptCacheKey != "" {
+		payload["prompt_cache_key"] = req.PromptCacheKey
+	}
+	if control := decodeCacheControl(req.CacheControl); control != nil {
+		payload["cache_control"] = control
+	}
 
 	messages := make([]any, 0, len(req.Messages)+1)
-	if sys := anthropicSystemText(req.System); sys != "" {
+	if sys := anthropicSystemContent(req.System); sys != nil {
 		messages = append(messages, map[string]any{"role": "system", "content": sys})
 	}
 
@@ -311,11 +319,21 @@ func anthropicToChatPayload(req *anthropicRequest, modelID string) (map[string]a
 					fn["parameters"] = schema
 				}
 			}
-			tools = append(tools, map[string]any{"type": "function", "function": fn})
+			tool := map[string]any{"type": "function", "function": fn}
+			if control := decodeCacheControl(t.CacheControl); control != nil {
+				tool["cache_control"] = control
+			}
+			tools = append(tools, tool)
 		}
 		payload["tools"] = tools
 		if tc := anthropicToolChoice(req.ToolChoice); tc != nil {
 			payload["tool_choice"] = tc
+		}
+		var choice map[string]any
+		if json.Unmarshal(req.ToolChoice, &choice) == nil {
+			if disabled, ok := choice["disable_parallel_tool_use"].(bool); ok {
+				payload["parallel_tool_calls"] = !disabled
+			}
 		}
 	}
 	return payload, nil
@@ -346,12 +364,19 @@ func appendAnthropicMessage(messages *[]any, m anthropicMessage) error {
 
 	if role == "assistant" {
 		var textParts []string
+		var cachedTextParts []any
+		cacheMarked := false
 		var toolCalls []any
 		for _, b := range blocks {
 			switch b["type"] {
 			case "text":
 				if t, ok := b["text"].(string); ok && t != "" {
 					textParts = append(textParts, t)
+					part := copyCacheControl(map[string]any{"type": "text", "text": t}, b)
+					cachedTextParts = append(cachedTextParts, part)
+					if part["cache_control"] != nil {
+						cacheMarked = true
+					}
 				}
 			case "tool_use":
 				id, _ := b["id"].(string)
@@ -370,6 +395,9 @@ func appendAnthropicMessage(messages *[]any, m anthropicMessage) error {
 		msg := map[string]any{"role": "assistant"}
 		if len(textParts) > 0 {
 			msg["content"] = strings.Join(textParts, "\n")
+			if cacheMarked {
+				msg["content"] = cachedTextParts
+			}
 		} else {
 			msg["content"] = nil
 		}
@@ -395,13 +423,13 @@ func appendAnthropicMessage(messages *[]any, m anthropicMessage) error {
 		switch b["type"] {
 		case "text":
 			if t, ok := b["text"].(string); ok && t != "" {
-				parts = append(parts, map[string]any{"type": "text", "text": t})
+				parts = append(parts, copyCacheControl(map[string]any{"type": "text", "text": t}, b))
 			}
 		case "image":
 			if u := anthropicImageURL(b); u != "" {
-				parts = append(parts, map[string]any{
+				parts = append(parts, copyCacheControl(map[string]any{
 					"type": "image_url", "image_url": map[string]any{"url": u},
-				})
+				}, b))
 			}
 		case "document":
 			if u := anthropicDocumentDataURL(b); u != "" {
@@ -422,9 +450,9 @@ func appendAnthropicMessage(messages *[]any, m anthropicMessage) error {
 			if content == "" {
 				content = "(no output)"
 			}
-			*messages = append(*messages, map[string]any{
+			*messages = append(*messages, copyCacheControl(map[string]any{
 				"role": "tool", "tool_call_id": id, "content": content,
-			})
+			}, b))
 		}
 	}
 	flush()
@@ -609,10 +637,7 @@ func chatToAnthropicMessage(out map[string]any, publicModel string) map[string]a
 		"content":       content,
 		"stop_reason":   stopReason,
 		"stop_sequence": nil,
-		"usage": map[string]any{
-			"input_tokens":  usage.PromptTokens,
-			"output_tokens": usage.CompletionTokens,
-		},
+		"usage":         anthropicUsage(usage),
 	}
 }
 

@@ -6,6 +6,26 @@ import (
 	"testing"
 )
 
+func TestMergeKeepsRegistrationMetadata(t *testing.T) {
+	metadata := &Record{Email: "same@example.com", Status: StatusRegistered, MachineID: "original-machine", UserAgent: "original-agent", AcceptLanguage: "zh-CN", SecCHUA: "browser-hint", Platform: "Windows"}
+	for _, status := range []string{StatusRegistered, StatusEnrolled} {
+		merged := Merge(metadata, &Record{Email: metadata.Email, Status: status})
+		if merged.MachineID != metadata.MachineID || merged.UserAgent != metadata.UserAgent || merged.AcceptLanguage != metadata.AcceptLanguage || merged.SecCHUA != metadata.SecCHUA || merged.Platform != metadata.Platform {
+			t.Fatalf("metadata erased by %s update", status)
+		}
+	}
+	missing := &Record{Email: metadata.Email, Status: metadata.Status}
+	filled := Merge(missing, metadata)
+	if filled.MachineID != metadata.MachineID || filled.UserAgent != metadata.UserAgent {
+		t.Fatal("same-rank merge failed to fill missing registration metadata")
+	}
+	other := &Record{Email: metadata.Email, Status: metadata.Status, MachineID: "different-machine", UserAgent: "different-agent"}
+	kept := Merge(metadata, other)
+	if kept.MachineID != metadata.MachineID || kept.UserAgent != metadata.UserAgent {
+		t.Fatal("progress merge replaced an existing identity")
+	}
+}
+
 func TestStatusRankMonotonic(t *testing.T) {
 	order := []string{
 		"", StatusFailed, StatusRegistered, StatusVerified, StatusKeyed, StatusEnrolled,

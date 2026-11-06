@@ -22,11 +22,15 @@ const maxRequestBody = 32 << 20
 
 // Usage 是归一化后的 token / 成本用量。
 type Usage struct {
-	PromptTokens     int
-	CompletionTokens int
-	TotalTokens      int
-	ReasoningTokens  int
-	Cost             float64
+	PromptTokens          int
+	CompletionTokens      int
+	TotalTokens           int
+	ReasoningTokens       int
+	CacheReadTokens       int
+	CacheCreationTokens   int
+	CacheCreation5mTokens int
+	CacheCreation1hTokens int
+	Cost                  float64
 }
 
 // Add 累加用量。
@@ -35,6 +39,10 @@ func (u *Usage) Add(v Usage) {
 	u.CompletionTokens += v.CompletionTokens
 	u.TotalTokens += v.TotalTokens
 	u.ReasoningTokens += v.ReasoningTokens
+	u.CacheReadTokens += v.CacheReadTokens
+	u.CacheCreationTokens += v.CacheCreationTokens
+	u.CacheCreation5mTokens += v.CacheCreation5mTokens
+	u.CacheCreation1hTokens += v.CacheCreation1hTokens
 	u.Cost += v.Cost
 }
 
@@ -100,7 +108,13 @@ func (s *Server) openModel(ctx context.Context, path string, body []byte, affini
 		used    *deepai.Account
 	)
 	for i := 0; i < maxTries; i++ {
-		acct := s.Store.NextAccountGroup(group)
+		var acct *deepai.Account
+		if i == 0 && affinity != "" {
+			acct = s.cachedSessionAccount(ctx, group, affinity)
+		}
+		if acct == nil {
+			acct = s.Store.NextAccountGroup(group)
+		}
 		if acct == nil {
 			break
 		}
@@ -118,6 +132,9 @@ func (s *Server) openModel(ctx context.Context, path string, body []byte, affini
 
 		if resp.StatusCode/100 == 2 {
 			s.Store.MarkAccountResult(acct.ID, true, "")
+			if affinity != "" {
+				s.rememberSessionAccount(ctx, group, affinity, acct.ID)
+			}
 			return resp, acct, nil
 		}
 
@@ -253,10 +270,98 @@ func parseUsage(v any) Usage {
 	if d, ok := m["output_tokens_details"].(map[string]any); ok && u.ReasoningTokens == 0 {
 		u.ReasoningTokens = intOf(d["reasoning_tokens"])
 	}
+	u.CacheReadTokens = intOf(m["cache_read_input_tokens"])
+	u.CacheCreationTokens = intOf(m["cache_creation_input_tokens"])
+	for _, name := range []string{"prompt_tokens_details", "input_tokens_details"} {
+		if details, ok := m[name].(map[string]any); ok {
+			if u.CacheReadTokens == 0 {
+				u.CacheReadTokens = intOf(details["cached_tokens"])
+			}
+			if u.CacheCreationTokens == 0 {
+				u.CacheCreationTokens = intOf(details["cache_write_tokens"])
+			}
+		}
+	}
+	if creation, ok := m["cache_creation"].(map[string]any); ok {
+		u.CacheCreation5mTokens = intOf(creation["ephemeral_5m_input_tokens"])
+		u.CacheCreation1hTokens = intOf(creation["ephemeral_1h_input_tokens"])
+		if u.CacheCreationTokens == 0 {
+			u.CacheCreationTokens = u.CacheCreation5mTokens + u.CacheCreation1hTokens
+		}
+	}
+	// Anthropic input_tokens excludes cache reads/writes; OpenAI input totals
+	// already include them. Keep one total internally to avoid double counting.
+	_, hasChatTotal := m["prompt_tokens"]
+	_, hasResponsesDetails := m["input_tokens_details"]
+	_, hasAnthropicRead := m["cache_read_input_tokens"]
+	_, hasAnthropicWrite := m["cache_creation_input_tokens"]
+	if !hasChatTotal && !hasResponsesDetails && (hasAnthropicRead || hasAnthropicWrite) {
+		u.PromptTokens += u.CacheReadTokens + u.CacheCreationTokens
+		if intOf(m["total_tokens"]) == 0 {
+			u.TotalTokens = u.PromptTokens + u.CompletionTokens
+		}
+	}
 	if c, ok := m["cost_details"].(map[string]any); ok && u.Cost == 0 {
 		u.Cost = floatOf(c["upstream_inference_cost"])
 	}
 	return u
+}
+
+// Streaming providers may split input/cache usage and output usage into separate
+// chunks. Update only the counters actually present in the new frame.
+func mergeStreamUsage(current Usage, value any) Usage {
+	m, ok := value.(map[string]any)
+	if !ok {
+		return current
+	}
+	next := parseUsage(m)
+	present := func(names ...string) bool {
+		for _, name := range names {
+			if v, ok := m[name]; ok && v != nil {
+				return true
+			}
+		}
+		return false
+	}
+	detail := func(field string, names ...string) bool {
+		for _, name := range names {
+			if nested, ok := m[name].(map[string]any); ok {
+				if v, ok := nested[field]; ok && v != nil {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	oldRead, oldWrite := current.CacheReadTokens, current.CacheCreationTokens
+	if present("cache_read_input_tokens") || detail("cached_tokens", "prompt_tokens_details", "input_tokens_details") {
+		current.CacheReadTokens = next.CacheReadTokens
+	}
+	if present("cache_creation_input_tokens", "cache_creation") || detail("cache_write_tokens", "prompt_tokens_details", "input_tokens_details") {
+		current.CacheCreationTokens = next.CacheCreationTokens
+		current.CacheCreation5mTokens = next.CacheCreation5mTokens
+		current.CacheCreation1hTokens = next.CacheCreation1hTokens
+	}
+	if present("prompt_tokens", "input_tokens") {
+		current.PromptTokens = next.PromptTokens
+	} else if present("cache_read_input_tokens", "cache_creation_input_tokens") {
+		current.PromptTokens += current.CacheReadTokens - oldRead + current.CacheCreationTokens - oldWrite
+	}
+	if present("completion_tokens", "output_tokens") {
+		current.CompletionTokens = next.CompletionTokens
+	}
+	if detail("reasoning_tokens", "completion_tokens_details", "output_tokens_details") {
+		current.ReasoningTokens = next.ReasoningTokens
+	}
+	if present("cost", "cost_details") {
+		current.Cost = next.Cost
+	}
+	if present("total_tokens") {
+		current.TotalTokens = next.TotalTokens
+	} else {
+		current.TotalTokens = current.PromptTokens + current.CompletionTokens
+	}
+	return current
 }
 
 func intOf(v any) int {
@@ -288,18 +393,20 @@ func floatOf(v any) float64 {
 // record 记录一次请求元信息。
 func (s *Server) record(key string, acct *deepai.Account, model, endpoint string, stream bool, status int, start time.Time, inLen, outLen int, usage Usage, err error) {
 	e := store.LogEntry{
-		Time:      time.Now().Unix(),
-		Key:       mask(key),
-		Model:     model,
-		Endpoint:  endpoint,
-		Stream:    stream,
-		Status:    status,
-		LatencyMS: time.Since(start).Milliseconds(),
-		PromptLen: inLen,
-		OutputLen: outLen,
-		TokensIn:  usage.PromptTokens,
-		TokensOut: usage.CompletionTokens,
-		Cost:      usage.Cost,
+		Time:                time.Now().Unix(),
+		Key:                 mask(key),
+		Model:               model,
+		Endpoint:            endpoint,
+		Stream:              stream,
+		Status:              status,
+		LatencyMS:           time.Since(start).Milliseconds(),
+		PromptLen:           inLen,
+		OutputLen:           outLen,
+		TokensIn:            usage.PromptTokens,
+		TokensOut:           usage.CompletionTokens,
+		CacheReadTokens:     usage.CacheReadTokens,
+		CacheCreationTokens: usage.CacheCreationTokens,
+		Cost:                usage.Cost,
 	}
 	if acct != nil {
 		e.Account = acct.ID

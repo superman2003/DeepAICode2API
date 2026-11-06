@@ -101,6 +101,7 @@
     <button data-tab="keys">密钥</button>
     <button data-tab="logs">日志</button>
     <button data-tab="settings">设置</button>
+    <button data-tab="update">更新</button>
   </nav>
 
   <section id="tab-overview" class="on">
@@ -167,19 +168,39 @@
     <div class="card">
       <h2>批量注册 / 号池入池</h2>
       <div class="grid2">
-        <div><label>数量（1-50）</label><input id="regCount" type="number" min="1" max="50" value="1"></div>
+        <div><label id="regCountLabel">数量（1-1000）</label><input id="regCount" type="number" min="1" max="1000" value="1"></div>
         <div><label>并发（1-5）</label><input id="regConcurrency" type="number" min="1" max="5" value="1"></div>
         <div><label>邮箱域名（可选）</label><input id="regDomain" placeholder="留空使用配置域名"></div>
         <div><label>邮箱后端</label><select id="regBackend">
           <option value="">自动</option><option value="cf">CF Temp Email</option>
+          <option value="qqimap">域名邮箱 + QQ IMAP</option>
+          <option value="tempmail_lol">TempMail.lol（外部临时邮箱）</option>
           <option value="static">静态域名（无收件箱）</option><option value="none">固定邮箱</option>
         </select></div>
         <div><label>号池分组</label><input id="regGroup" value="default"></div>
         <div><label>指定邮箱（可选，数量必须为 1）</label><input id="regEmail" placeholder="留空自动创建临时邮箱"></div>
         <div><label>指定密码（可选）</label><input id="regPassword" placeholder="留空自动生成"></div>
         <div><label>自动收信验证</label><select id="regVerify">
-          <option value="true">开启（验证后 +200 Theos）</option><option value="false">关闭</option>
+          <option value="true">开启（自动完成邮箱验证）</option><option value="false">关闭</option>
         </select></div>
+      </div>
+      <div id="qqImapPanel" style="display:none;margin-top:12px">
+        <div class="grid2">
+          <div><label>QQ 收信邮箱</label><input id="regImapUser" type="email" autocomplete="off" placeholder="123456@qq.com；留空使用服务端配置"></div>
+          <div><label>QQ IMAP 授权码</label><input id="regImapAuthCode" type="password" autocomplete="new-password" placeholder="QQ 邮箱设置中生成的授权码"></div>
+          <div><label>IMAP 服务器</label><input id="regImapHost" placeholder="imap.qq.com（默认）"></div>
+          <div><label>TLS 端口</label><input id="regImapPort" type="number" min="1" max="65535" placeholder="993（默认）"></div>
+          <div><label>收件文件夹</label><input id="regImapFolder" placeholder="INBOX（默认）"></div>
+        </div>
+        <div class="hint">将上方域名的所有注册地址（Catch-all）转发到这个 QQ 邮箱，并在 QQ 邮箱开启 IMAP 服务。程序按原始域名收件地址匹配验证邮件；只读取邮件，不标记已读或删除。授权码不会写入浏览器存储或注册记录；留空使用服务端配置。</div>
+        <div class="row" style="margin-top:10px"><button class="btn" id="testImap">测试邮箱连接</button><span id="imapTestStatus" class="muted"></span></div>
+      </div>
+      <div id="tempmailLOLPanel" style="display:none;margin-top:12px">
+        <div class="grid2">
+          <div><label>TempMail.lol API Key（可选）</label><input id="regLOLKey" type="password" autocomplete="new-password" placeholder="留空使用服务端已配置的密钥"></div>
+          <div><label>TempMail.lol 域名（可选）</label><input id="regLOLDomain" placeholder="留空随机分配；也可填已绑定的自有域名"></div>
+        </div>
+        <div class="hint">自动创建外部临时邮箱并收取验证邮件，无需 QQ IMAP 或自建邮箱服务。上方的邮箱域名和指定邮箱不用于此后端。收信令牌仅保存在服务器私有目录，邮箱有效期由 TempMail.lol 决定。</div>
       </div>
       <label>代理池（每行一个，http://user:pass@host:port；留空使用服务端 .env）</label>
       <textarea id="regProxyPool" placeholder="http://user:pass@host:port"></textarea>
@@ -222,7 +243,7 @@
         <button class="btn danger" id="clearLogs">清空</button>
       </div>
       <table><thead><tr>
-        <th>时间</th><th>端点</th><th>模型</th><th>流式</th><th>状态</th><th>耗时</th><th>字符</th><th>Token</th><th>成本</th><th>账号</th><th>错误</th>
+        <th>时间</th><th>端点</th><th>模型</th><th>流式</th><th>状态</th><th>耗时</th><th>字符</th><th>Token</th><th>缓存读 / 写</th><th>成本</th><th>账号</th><th>错误</th>
       </tr></thead><tbody id="logs"></tbody></table>
       <div class="hint">只记录元信息（模型、耗时、长度、用量），不落对话内容。</div>
     </div>
@@ -246,6 +267,23 @@
         <button class="btn primary" id="saveSettings">保存设置</button>
         <button class="btn danger" id="clearStats">重置统计</button>
       </div>
+    </div>
+  </section>
+  <section id="tab-update">
+    <div class="card">
+      <h2>程序更新</h2>
+      <div class="row"><span>当前版本：<strong id="updateCurrent">-</strong></span><span>最新版本：<strong id="updateTarget">-</strong></span></div>
+      <label>GitHub Release 仓库（owner/repo）</label>
+      <div class="row"><input id="updateRepository" placeholder="superman2003/DeepAICode2API" style="width:360px"><button class="btn" id="saveUpdateRepository">保存来源</button></div>
+      <div class="hint">从该仓库下载专用 Windows 升级包，校验 SHA256 后只替换程序与内嵌网页。.env、账号库、密钥、收信令牌保持原文件。注册任务运行时不能重启升级。</div>
+      <div class="row" style="margin-top:14px">
+        <button class="btn" id="checkUpdate">检查更新</button>
+        <button class="btn" id="prepareUpdate" disabled>下载并校验</button>
+        <button class="btn primary" id="applyUpdate" disabled>安装并重启</button>
+      </div>
+      <p id="updateStatus" class="muted">等待检查。</p>
+      <pre id="updateNotes" style="white-space:pre-wrap;word-break:break-word"></pre>
+      <div class="hint">重启会短暂中断接口。新版本启动或账号库兼容性检查失败时，启动器会恢复旧程序。首次使用需要运行含更新器的完整包。</div>
     </div>
   </section>
 </main>
@@ -372,6 +410,8 @@
       ["失败请求", fmtNum(s.failed_requests)],
       ["输出字符", fmtNum(s.total_chars_out)],
       ["Token 入 / 出", fmtNum(s.total_tokens_in) + " / " + fmtNum(s.total_tokens_out)],
+	  ["缓存读取 Token", fmtNum(s.total_cache_read_tokens)],
+	  ["缓存写入 Token", fmtNum(s.total_cache_creation_tokens)],
       ["上游成本", fmtCost(s.total_cost)],
       ["账号（就绪/总）", ready + " / " + accts.length],
       ["密钥", (d.keys||[]).length],
@@ -518,7 +558,7 @@
   function renderLogs(logs){
     var tb = $("#logs");
     tb.textContent = "";
-    if (!logs || !logs.length) { tb.appendChild(emptyRow(11, "暂无日志")); return; }
+    if (!logs || !logs.length) { tb.appendChild(emptyRow(12, "暂无日志")); return; }
     for (var li = logs.length - 1; li >= 0; li--) {
       var l = logs[li];
       var st = cell("");
@@ -530,6 +570,7 @@
         cell(l.stream ? "是" : "否", "mono"), st, cell(l.latency_ms + "ms", "mono"),
         cell(l.prompt_len + " / " + l.output_len, "mono"),
         cell(fmtNum(l.tokens_in) + " / " + fmtNum(l.tokens_out), "mono"),
+        cell(fmtNum(l.cache_read_tokens) + " / " + fmtNum(l.cache_creation_tokens), "mono"),
         cell(fmtCost(l.cost), "mono"),
         cell(l.account, "mono"), errCell
       ]));
@@ -549,6 +590,9 @@
   function refresh(){
     return api("/admin/api/state").then(function(d){
       state.data = d;
+      var registrationMax = d.registration_max_count || 1000;
+      $("#regCount").max = String(registrationMax);
+      $("#regCountLabel").textContent = "数量（1-" + registrationMax + "）";
       renderOverview(d);
       renderAccounts(d);
       renderKeys(d);
@@ -599,6 +643,7 @@
       $("#tab-" + b.dataset.tab).classList.add("on");
       if (b.dataset.tab === "logs") refreshLogs();
       if (b.dataset.tab === "register") loadRegisterJobs();
+      if (b.dataset.tab === "update") loadUpdater();
     };
   });
 
@@ -763,6 +808,43 @@
     }).catch(function(){});
   }
 
+  $("#regBackend").onchange = function(){
+    $("#qqImapPanel").style.display = this.value === "qqimap" ? "block" : "none";
+    var lol = this.value === "tempmail_lol";
+    $("#tempmailLOLPanel").style.display = lol ? "block" : "none";
+    $("#regDomain").disabled = lol;
+    $("#regEmail").disabled = lol;
+  };
+
+  function mailboxConfig(){
+    var body = {domain: $("#regDomain").value.trim(), mail_backend: $("#regBackend").value};
+    if (body.mail_backend === "qqimap") {
+      body.qq_imap_user = $("#regImapUser").value.trim();
+      body.qq_imap_auth_code = $("#regImapAuthCode").value.trim();
+      body.qq_imap_host = $("#regImapHost").value.trim();
+      body.qq_imap_port = parseInt($("#regImapPort").value, 10) || 0;
+      body.qq_imap_folder = $("#regImapFolder").value.trim();
+    }
+    if (body.mail_backend === "tempmail_lol") {
+      body.domain = $("#regLOLDomain").value.trim();
+      body.tempmail_lol_api_key = $("#regLOLKey").value.trim();
+    }
+    return body;
+  }
+
+  $("#testImap").onclick = function(){
+    var button = this;
+    button.disabled = true;
+    $("#imapTestStatus").textContent = "正在连接…";
+    api("/admin/api/register/mailbox-test", {method:"POST", body:mailboxConfig()}).then(function(r){
+      $("#imapTestStatus").textContent = r.message;
+      toast("邮箱连接测试通过", "ok");
+    }).catch(function(e){
+      $("#imapTestStatus").textContent = e.message;
+      toast("邮箱连接失败：" + e.message, "err");
+    }).finally(function(){ button.disabled = false; });
+  };
+
   $("#startRegister").onclick = function(){
     var body = {
       count: parseInt($("#regCount").value, 10) || 1,
@@ -776,12 +858,52 @@
       proxy_pool: $("#regProxyPool").value.trim(),
       no_fingerprint: $("#regNoFingerprint").checked
     };
+    Object.assign(body, mailboxConfig());
+    if (body.mail_backend === "tempmail_lol") body.email = "";
     api("/admin/api/register", {method:"POST", body:body}).then(function(r){
       toast("注册任务已启动：" + r.id, "ok");
       $("#regStatus").textContent = "运行中…";
       pollRegister(r.id);
     }).catch(function(e){ toast("启动失败：" + e.message, "err"); });
   };
+
+  // --- Release updater ---
+  var updateTimer=null,updateWait=false,updatePollFailures=0;
+  function renderUpdater(info){
+    var labels={idle:"等待检查",available:"发现新版本，可下载校验",current:"当前已是最新版本",downloading:"正在下载并校验",ready:"校验通过，可以安装重启",applying:"正在保存并停止旧程序",replacing:"正在替换程序",restarting:"正在启动新版本",succeeded:"更新成功",rolling_back:"新版本未通过检查，正在回滚",rolled_back:"已恢复旧程序",failed:"更新未完成"};
+    $("#updateCurrent").textContent=info.current_version || "-";
+    $("#updateTarget").textContent=info.target_version || "-";
+    var active=["downloading","applying","replacing","restarting","rolling_back"].indexOf(info.phase)>=0;
+    if(document.activeElement!==$("#updateRepository")) $("#updateRepository").value=info.repository || "";
+    $("#checkUpdate").disabled=active;
+    $("#saveUpdateRepository").disabled=active;
+    $("#prepareUpdate").disabled=info.phase!=="available" || !info.supported;
+    $("#applyUpdate").disabled=info.phase!=="ready" || !info.supported || !info.managed;
+    var text=labels[info.phase] || info.phase;
+    if(info.error)text+="："+info.error;
+    if(!info.managed)text+="。当前启动器不支持网页重启，请使用新版 run-windows.cmd。";
+    $("#updateStatus").textContent=text;
+    $("#updateNotes").textContent=info.notes || "";
+    if(info.phase==="succeeded" && updateWait){updateWait=false;toast("更新成功，正在刷新页面","ok");setTimeout(function(){location.reload();},700);}
+    if(["rolled_back","failed"].indexOf(info.phase)>=0)updateWait=false;
+    if(active){updateTimer=setTimeout(loadUpdater,1500);}
+  }
+  function loadUpdater(){
+    if(updateTimer){clearTimeout(updateTimer);updateTimer=null;}
+    api("/admin/api/update").then(function(info){updatePollFailures=0;renderUpdater(info);}).catch(function(error){
+      $("#updateStatus").textContent=updateWait ? "重启连接中，等待服务恢复…" : error.message;
+      if(updateWait && updatePollFailures++<100)updateTimer=setTimeout(loadUpdater,1500);
+    });
+  }
+  function updateAction(action,extra){
+    if(updateTimer){clearTimeout(updateTimer);updateTimer=null;}
+    var body=extra || {};body.action=action;
+    return api("/admin/api/update",{method:"POST",body:body}).then(renderUpdater).catch(function(error){toast(error.message,"err");updateWait=false;loadUpdater();});
+  }
+  $("#saveUpdateRepository").onclick=function(){updateAction("configure",{repository:$("#updateRepository").value.trim()});};
+  $("#checkUpdate").onclick=function(){this.disabled=true;$("#updateStatus").textContent="正在检查 GitHub Release…";updateAction("check");};
+  $("#prepareUpdate").onclick=function(){this.disabled=true;updateAction("prepare");};
+  $("#applyUpdate").onclick=function(){this.disabled=true;updateWait=true;updatePollFailures=0;updateAction("apply");};
 
   // --- 浏览器登录 ---
   var oauthTimer = null, oauthSid = null, oauthDeadline = 0;

@@ -1,0 +1,11 @@
+# Merge these fields into your own Codex config; replace SERVER_IP first.
+# Set DEEPAI2API_GATEWAY_KEY to a gateway API key in the terminal running Codex.
+model = "glm-5.3-flash"
+model_provider = "deepaicode"
+
+[model_providers.deepaicode]
+name = "DeepAICode2API"
+base_url = "http://SERVER_IP:10087/v1"
+env_key = "DEEPAI2API_GATEWAY_KEY"
+wire_api = "responses"
+supports_websockets = false

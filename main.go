@@ -1,11 +1,12 @@
 // DeepAICode2API 把本机 DeepAI Code 桌面端的上游模型服务，
 // 逆向复刻成一个 OpenAI / Anthropic 兼容的 Go 网关。
 //
-// 复用桌面端已登录的 API Key，无需另申请密钥；纯 Go 标准库实现。
+// 复用桌面端已登录的 API Key，无需另申请密钥；编译为单文件 Go 服务。
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -20,8 +21,10 @@ import (
 	"time"
 
 	"deepaicode2api/internal/deepai"
+	"deepaicode2api/internal/proxychain"
 	"deepaicode2api/internal/server"
 	"deepaicode2api/internal/store"
+	"deepaicode2api/internal/updater"
 )
 
 // version 由构建时注入：-ldflags "-X main.version=1.0.0"
@@ -38,6 +41,7 @@ func main() {
 		adminPw    = flag.String("admin-password", envOr("DEEPAI2API_ADMIN_PASSWORD", ""), "管理密码（非空时覆盖状态文件中的设置）")
 		allowOpen  = flag.Bool("allow-insecure", envBool("DEEPAI2API_ALLOW_INSECURE", false), "允许非回环监听但不设管理密码（不安全）")
 		showVer    = flag.Bool("version", false, "打印版本后退出")
+		checkState = flag.Bool("check-state", false, "只校验账号状态文件并打印数量，不出网")
 	)
 	flag.Parse()
 
@@ -54,7 +58,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("打开状态文件失败: %v", err)
 	}
+	if *checkState {
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "accounts": len(st.Accounts()), "keys": len(st.Keys()), "encrypted": st.Encrypted()})
+		return
+	}
 	log.Printf("状态文件: %s", st.Path())
+	if egress := strings.TrimSpace(os.Getenv(proxychain.EnvEgressProxy)); egress != "" {
+		log.Printf("远程代理连接出口: %s（保留代理池，先经此出口连接）", deepai.MaskProxy(egress))
+	}
 	if st.MasterKeySet() {
 		log.Printf("状态文件加密: 已启用（AES-256-GCM，密钥来自 %s）", store.EnvMasterKey)
 	} else {
@@ -118,9 +129,32 @@ func main() {
 	}
 
 	srv := server.New(st)
+	srv.Version = version
+	updateStop := make(chan struct{}, 1)
+	projectRoot := filepath.Dir(os.Args[0])
+	if executable, err := os.Executable(); err == nil {
+		projectRoot = filepath.Dir(executable)
+	}
+	if strings.EqualFold(filepath.Base(projectRoot), "bin") {
+		projectRoot = filepath.Dir(projectRoot)
+	}
+	manager, updateErr := updater.New(projectRoot, filepath.Dir(st.Path()), version, func() {
+		select {
+		case updateStop <- struct{}{}:
+		default:
+		}
+	})
+	if updateErr != nil {
+		log.Printf("更新器初始化失败: %v", updateErr)
+	} else {
+		srv.Updater = manager
+	}
 
-	// 启动时同步拉一次模型目录；失败不阻塞启动（会沿用缓存 / 兜底模型）。
-	if models, err := srv.RefreshModels(context.Background()); err != nil {
+	// A migrated server already has a catalog. Fast startup uses that cache
+	// immediately; the existing periodic refresh remains active.
+	if envBool("DEEPAI2API_FAST_START", false) && len(st.Models()) > 0 {
+		log.Printf("快速启动：使用已保存的 %d 个模型，启动阶段不等待外网", len(st.Models()))
+	} else if models, err := srv.RefreshModels(context.Background()); err != nil {
 		log.Printf("拉取模型目录失败（沿用缓存）: %v", err)
 	} else {
 		log.Printf("模型目录已更新：%d 个模型，默认 %s", len(models), st.DefaultModel())
@@ -157,7 +191,12 @@ func main() {
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	<-stop
+	updateRequested := false
+	select {
+	case <-stop:
+	case <-updateStop:
+		updateRequested = true
+	}
 
 	close(stopBG)
 	log.Printf("正在关闭…")
@@ -168,8 +207,17 @@ func main() {
 	}
 	if err := st.Save(); err != nil {
 		log.Printf("保存状态失败: %v", err)
+		if updateRequested {
+			if manager != nil {
+				manager.CancelApply("保存账号状态失败，升级已取消")
+			}
+			os.Exit(1)
+		}
 	}
 	log.Printf("已退出")
+	if updateRequested {
+		os.Exit(updater.UpdateExitCode)
+	}
 }
 
 // background 负责定期持久化与模型目录刷新。

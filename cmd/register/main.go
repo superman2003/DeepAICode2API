@@ -43,7 +43,7 @@ func main() {
 		email         = flag.String("email", "", "指定邮箱（count 必须为 1；留空自动创建临时邮箱）")
 		password      = flag.String("password", "", "指定密码（留空自动生成）")
 		domain        = flag.String("domain", "", "邮箱域名 / 后缀（覆盖配置）")
-		backend       = flag.String("mail-backend", "", "邮箱后端：cf / static / none（留空自动选择）")
+		backend       = flag.String("mail-backend", "", "邮箱后端：cf / qqimap / tempmail_lol / static / none（留空自动选择）")
 		gateway       = flag.String("gateway", "", "2API 网关地址（默认取 DEEPAI2API_GATEWAY 或 http://127.0.0.1:10087）")
 		adminPw       = flag.String("admin-password", "", "网关管理密码（默认取 DEEPAI2API_ADMIN_PASSWORD）")
 		ledgerPath    = flag.String("ledger", "", "台账路径（默认 exports/register-ledger.jsonl）")
@@ -190,6 +190,11 @@ func main() {
 	provider, err := register.NewProvider(cfg, backendName, cfg.DefaultDomain, *email)
 	if err != nil {
 		fatalf("初始化邮箱后端失败: %v", err)
+	}
+	if backendName == "qqimap" && *verify {
+		if err := provider.(register.HealthProvider).Health(context.Background()); err != nil {
+			fatalf("注册前邮箱检查失败: %v", err)
+		}
 	}
 
 	var enroller register.Enroller
@@ -408,6 +413,14 @@ func printDoctor(cfg *register.Config, pool *register.ProxyPool) {
 		fmt.Printf("  域名：%s\n", cfg.DefaultDomain)
 		fmt.Println("  注意：static 后端没有收件箱，无法自动完成邮箱验证")
 	}
+	if backend == "qqimap" {
+		fmt.Printf("  域名：%s；IMAP：%s:%d；文件夹：%s\n", cfg.DefaultDomain, cfg.QQIMAPHost, cfg.QQIMAPPort, cfg.QQIMAPFolder)
+		fmt.Printf("  QQ 邮箱：%s；授权码：%s\n", maskSecret(cfg.QQIMAPUser), boolLabel(cfg.QQIMAPAuthCode != ""))
+	}
+	if backend == "tempmail_lol" {
+		fmt.Printf("  TempMail.lol：%s；API Key：%s\n", maskURL(cfg.TempMailLOLBase), boolLabel(cfg.TempMailLOLKey != ""))
+		fmt.Println("  临时邮箱将在注册时创建；doctor 仅检查配置")
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -433,6 +446,8 @@ func printDoctor(cfg *register.Config, pool *register.ProxyPool) {
 	}
 	fmt.Println("\n环境变量：TEMPMAIL_BASE / TEMPMAIL_ADMIN_KEY / TEMPMAIL_DOMAIN，")
 	fmt.Println("          或 DEEPAI_REGISTER_DOMAIN + -mail-backend static；")
+	fmt.Println("          或 DEEPAI_REGISTER_DOMAIN / QQ_IMAP_USER / QQ_IMAP_AUTH_CODE + -mail-backend qqimap；")
+	fmt.Println("          或 TEMPMAIL_LOL_API_KEY + -mail-backend tempmail_lol；")
 	fmt.Println("          网关 DEEPAI2API_GATEWAY / DEEPAI2API_ADMIN_PASSWORD。")
 }
 

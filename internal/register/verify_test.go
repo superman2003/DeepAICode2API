@@ -6,9 +6,37 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestVerifyBackfillPublishesAndPersistsTimeout(t *testing.T) {
+	ledger := NewLedger(filepath.Join(t.TempDir(), "ledger.jsonl"))
+	defer ledger.Close()
+	var update *Record
+	p := New(Options{Config: &Config{}, Ledger: ledger, OnUpdate: func(rec *Record) { update = rec }})
+	rec := NewRecord("saved@example.com")
+	rec.Status = StatusEnrolled
+	rec.APIKey = "fake-key"
+	rec.Mark("verify", "pending", 0)
+	ch := make(chan verifyOutcome, 1)
+	ch <- verifyOutcome{err: context.DeadlineExceeded, waited: time.Minute}
+	p.verifyPending.Add(1)
+	p.verifyWG.Add(1)
+	p.verifyBackfill(rec, nil, ch)
+	if update == nil || update.Stages["verify"] != "warning" || update.Status != StatusEnrolled || !strings.Contains(update.LastError, "邮箱验证未完成") {
+		t.Fatalf("timeout left UI pending: %#v", update)
+	}
+	if rec.Stages["verify"] != "pending" {
+		t.Fatal("background verification modified the original record")
+	}
+	records, err := ledger.Load()
+	if err != nil || len(records) != 1 || records[0].Stages["verify"] != "warning" {
+		t.Fatalf("timeout not persisted: %v %v", records, err)
+	}
+}
 
 // HTTPEnroller 必须实现 VerifiedMarker，否则后台验证无法回填。
 var _ VerifiedMarker = (*HTTPEnroller)(nil)

@@ -1,0 +1,43 @@
+name: Windows release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Stable version tag, for example v0.2.1'
+        required: true
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
+        with:
+          go-version-file: go.mod
+      - name: Tests
+        shell: pwsh
+        run: |
+          go test ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go vet ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build assets
+        shell: pwsh
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          $version = if ($env:REQUESTED_VERSION) { $env:REQUESTED_VERSION } else { $env:GITHUB_REF_NAME }
+          ./scripts/build-release.ps1 -Version $version
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          $version = if ($env:REQUESTED_VERSION) { $env:REQUESTED_VERSION } else { $env:GITHUB_REF_NAME }
+          gh release view $version --repo $env:GITHUB_REPOSITORY 2>$null
+          if ($LASTEXITCODE -eq 0) { Write-Host 'Release already exists; assets were preserved.'; exit 0 }
+          gh release create $version ./dist/release/DeepAICode2API_windows_amd64.zip ./dist/release/DeepAICode2API_windows_amd64_update.zip ./dist/release/SHA256SUMS.txt --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title $version --generate-notes

@@ -1,0 +1,10 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://SERVER_IP:10087",
+    "ANTHROPIC_AUTH_TOKEN": "YOUR_GATEWAY_API_KEY",
+    "ANTHROPIC_MODEL": "glm-5.3-flash",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.3-flash",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.3-flash",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-5.3-flash"
+  }
+}

@@ -69,8 +69,7 @@ type HealthProvider interface {
 
 // NewProvider 按名字构造邮箱后端。
 //
-// backend 为空时自动选择：配置了 CF Temp Email 就用 cf，否则有域名就用
-// static，两者都没有则用 none（必须显式提供邮箱）。
+// backend 为空时依次选择已配置的 cf、qqimap、tempmail_lol、static、none。
 func NewProvider(cfg *Config, backend, domain, email string) (Provider, error) {
 	if cfg == nil {
 		cfg = LoadConfig()
@@ -89,6 +88,31 @@ func NewProvider(cfg *Config, backend, domain, email string) (Provider, error) {
 			domain = firstNonEmpty(cfg.TempMailDomain, cfg.DefaultDomain)
 		}
 		return &cfProvider{base: base, adminKey: cfg.TempMailAdminKey, domain: domain, ua: cfg.UserAgent}, nil
+	case "qqimap":
+		if domain == "" {
+			domain = cfg.DefaultDomain
+		}
+		provider, err := newQQIMAPProvider(cfg, domain)
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(email) != "" {
+			if _, ok := provider.Inbox(email); !ok {
+				return nil, errors.New("QQ IMAP 指定邮箱必须属于配置的注册域名")
+			}
+		}
+		return provider, nil
+	case "tempmail_lol":
+		provider, err := newTempMailLOLProvider(cfg, domain)
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(email) != "" {
+			if _, ok := provider.Inbox(email); !ok {
+				return nil, errors.New("TempMail.lol 指定邮箱没有已保存的收信令牌，请留空自动创建邮箱")
+			}
+		}
+		return provider, nil
 	case "static":
 		if domain == "" {
 			domain = cfg.DefaultDomain
@@ -103,7 +127,7 @@ func NewProvider(cfg *Config, backend, domain, email string) (Provider, error) {
 		}
 		return &noneProvider{email: strings.TrimSpace(email)}, nil
 	default:
-		return nil, fmt.Errorf("未知邮箱后端 %q（可选 cf / static / none）", backend)
+		return nil, fmt.Errorf("未知邮箱后端 %q（可选 cf / qqimap / tempmail_lol / static / none）", backend)
 	}
 }
 
@@ -393,7 +417,20 @@ func truncate(s string, n int) string {
 
 // CheckProvider 对邮箱后端做只读健康检查；无健康检查接口时直接通过。
 func CheckProvider(ctx context.Context, cfg *Config, backend, domain string) error {
-	p, err := NewProvider(cfg, backend, domain, "probe@example.com")
+	if cfg == nil {
+		cfg = LoadConfig()
+	}
+	name := strings.ToLower(strings.TrimSpace(backend))
+	if name == "" {
+		name = cfg.AutoBackend()
+	}
+	// A connection check has no registration recipient. Only the fixed-email
+	// backend needs a placeholder to construct its no-inbox provider.
+	email := ""
+	if name == "none" {
+		email = "probe@example.com"
+	}
+	p, err := NewProvider(cfg, name, domain, email)
 	if err != nil {
 		return err
 	}

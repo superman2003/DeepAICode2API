@@ -1,9 +1,12 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -37,12 +40,18 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	model := s.resolveModel(requestModelName(payload))
 	payload["model"] = model.ID
 	stream, _ := payload["stream"].(bool)
-	affinity := affinityFor(r, payload)
+	metadata, _ := json.Marshal(payload["metadata"])
+	affinity := prepareClientCache(r, payload, "codex", metadata, false)
 	key := extractKey(r)
 	promptLen := estimatePromptLen(payload)
 
 	if model.IsResponses() {
 		s.passthroughResponses(w, r, payload, model.ID, stream, affinity, key, start, promptLen)
+		return
+	}
+	r = r.WithContext(context.WithValue(r.Context(), customToolContext{}, customToolNames(payload)))
+	if previous := strOf(payload["previous_response_id"]); previous != "" {
+		writeErr(w, http.StatusBadRequest, "Chat 桥接模式不保存对话：请传入完整 input 历史，不要使用 previous_response_id；原生 Responses 模型可直接使用该字段。", "unsupported_previous_response_id")
 		return
 	}
 
@@ -130,12 +139,11 @@ func (s *Server) passthroughResponses(w http.ResponseWriter, r *http.Request, pa
 		}
 		rewriteResponsesModel(obj, publicModel)
 		if respObj, ok := obj["response"].(map[string]any); ok {
-			if u := parseUsage(respObj["usage"]); u.TotalTokens > 0 || u.Cost > 0 {
-				usage = u
-			}
+			usage = mergeStreamUsage(usage, respObj["usage"])
 		}
 		outLen += responsesEventTextLen(obj)
-		_, _ = w.Write([]byte("data: " + data + "\n\n"))
+		encoded, _ := json.Marshal(obj)
+		_, _ = w.Write([]byte("data: " + string(encoded) + "\n\n"))
 		sw.flush()
 		return true
 	})
@@ -162,6 +170,7 @@ func (s *Server) blockingResponsesAsChat(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	respObj := chatToResponsesObject(out, publicModel)
+	rewriteCustomToolOutput(respObj, responseCustomTools(r))
 	usage := parseUsage(out["usage"])
 	outLen := responsesTextLen(respObj)
 
@@ -190,11 +199,14 @@ func (s *Server) streamResponsesAsChat(w http.ResponseWriter, r *http.Request, c
 	sw := newSSEWriter(w)
 	w.WriteHeader(http.StatusOK)
 	gen := newResponsesStreamGen(sw, publicModel)
+	gen.customTools = responseCustomTools(r)
 	gen.created()
 
 	var (
-		usage  Usage
-		outLen int
+		usage            Usage
+		outLen           int
+		upstreamEventErr error
+		sawDone          bool
 	)
 	streamErr := readSSELines(resp.Body, func(line string) bool {
 		trimmed := strings.TrimSpace(line)
@@ -203,15 +215,20 @@ func (s *Server) streamResponsesAsChat(w http.ResponseWriter, r *http.Request, c
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
 		if data == "[DONE]" || data == "" {
+			if data == "[DONE]" {
+				sawDone = true
+			}
 			return data != "[DONE]"
 		}
 		var chunk map[string]any
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			return true
 		}
-		if u := parseUsage(chunk["usage"]); u.TotalTokens > 0 || u.Cost > 0 {
-			usage = u
+		if problem, ok := chunk["error"].(map[string]any); ok {
+			upstreamEventErr = fmt.Errorf("upstream stream error: %s", strOf(problem["message"]))
+			return false
 		}
+		usage = mergeStreamUsage(usage, chunk["usage"])
 		choices, _ := chunk["choices"].([]any)
 		if len(choices) == 0 {
 			return true
@@ -250,6 +267,12 @@ func (s *Server) streamResponsesAsChat(w http.ResponseWriter, r *http.Request, c
 		}
 		return true
 	})
+	if upstreamEventErr != nil {
+		streamErr = upstreamEventErr
+	}
+	if streamErr == nil && !sawDone && gen.finishReason == "" {
+		streamErr = fmt.Errorf("upstream stream ended before a completion marker")
+	}
 
 	if streamErr != nil {
 		gen.fail(streamErr)
@@ -278,6 +301,14 @@ func responsesToChatPayload(payload map[string]any, modelID string) (map[string]
 	if v, ok := payload["prompt_cache_key"]; ok {
 		out["prompt_cache_key"] = v
 	}
+	for _, field := range []string{"prompt_cache_retention", "prompt_cache_options", "parallel_tool_calls", "reasoning", "metadata"} {
+		if value, ok := payload[field]; ok {
+			out[field] = value
+		}
+	}
+	if boolOf(payload["stream"]) {
+		out["stream_options"] = map[string]any{"include_usage": true}
+	}
 
 	messages := make([]any, 0, 4)
 	if instructions, ok := payload["instructions"].(string); ok && strings.TrimSpace(instructions) != "" {
@@ -304,20 +335,33 @@ func responsesToChatPayload(payload map[string]any, modelID string) (map[string]
 				messages = append(messages, map[string]any{
 					"role": role, "content": responsesInputContent(item["content"]),
 				})
-			case "function_call":
+			case "function_call", "custom_tool_call":
 				callID := firstString(item["call_id"], item["id"])
-				messages = append(messages, map[string]any{
-					"role":    "assistant",
-					"content": nil,
-					"tool_calls": []any{map[string]any{
-						"id": callID, "type": "function",
-						"function": map[string]any{
-							"name":      strOf(item["name"]),
-							"arguments": strOf(item["arguments"]),
-						},
-					}},
-				})
-			case "function_call_output":
+				arguments := strOf(item["arguments"])
+				if strOf(item["type"]) == "custom_tool_call" {
+					raw, _ := json.Marshal(map[string]any{"input": strOf(item["input"])})
+					arguments = string(raw)
+				}
+				call := map[string]any{
+					"id": callID, "type": "function",
+					"function": map[string]any{
+						"name":      strOf(item["name"]),
+						"arguments": arguments,
+					},
+				}
+				merged := false
+				if len(messages) > 0 {
+					if previous, ok := messages[len(messages)-1].(map[string]any); ok && previous["role"] == "assistant" && previous["content"] == nil {
+						if calls, ok := previous["tool_calls"].([]any); ok {
+							previous["tool_calls"] = append(calls, call)
+							merged = true
+						}
+					}
+				}
+				if !merged {
+					messages = append(messages, map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{call}})
+				}
+			case "function_call_output", "custom_tool_call_output":
 				messages = append(messages, map[string]any{
 					"role":         "tool",
 					"tool_call_id": firstString(item["call_id"], item["id"]),
@@ -337,7 +381,7 @@ func responsesToChatPayload(payload map[string]any, modelID string) (map[string]
 		converted := make([]any, 0, len(tools))
 		for _, tv := range tools {
 			t, ok := tv.(map[string]any)
-			if !ok || strOf(t["type"]) != "function" {
+			if !ok || (strOf(t["type"]) != "function" && strOf(t["type"]) != "custom") {
 				continue
 			}
 			fn := map[string]any{"name": strOf(t["name"])}
@@ -346,6 +390,12 @@ func responsesToChatPayload(payload map[string]any, modelID string) (map[string]
 			}
 			if p, ok := t["parameters"]; ok {
 				fn["parameters"] = p
+			}
+			if strOf(t["type"]) == "custom" {
+				fn["parameters"] = map[string]any{"type": "object", "properties": map[string]any{"input": map[string]any{"type": "string", "description": "The exact free-form tool input."}}, "required": []any{"input"}, "additionalProperties": false}
+			}
+			if strict, ok := t["strict"].(bool); ok {
+				fn["strict"] = strict
 			}
 			converted = append(converted, map[string]any{"type": "function", "function": fn})
 		}
@@ -374,7 +424,7 @@ func responsesInputContent(v any) any {
 			switch strOf(p["type"]) {
 			case "input_text", "output_text", "text":
 				if t := strOf(p["text"]); t != "" {
-					parts = append(parts, map[string]any{"type": "text", "text": t})
+					parts = append(parts, copyCacheControl(map[string]any{"type": "text", "text": t}, p))
 				}
 			case "input_image":
 				if u := strOf(p["image_url"]); u != "" {
@@ -416,7 +466,7 @@ func convertResponsesToolChoice(v any) any {
 	case string:
 		return tc
 	case map[string]any:
-		if strOf(tc["type"]) == "function" && strOf(tc["name"]) != "" {
+		if (strOf(tc["type"]) == "function" || strOf(tc["type"]) == "custom") && strOf(tc["name"]) != "" {
 			return map[string]any{"type": "function", "function": map[string]any{"name": strOf(tc["name"])}}
 		}
 	}
@@ -485,16 +535,20 @@ func chatToResponsesObject(chat map[string]any, publicModel string) map[string]a
 		"parallel_tool_calls": true,
 		"tool_choice":         "auto",
 		"tools":               []any{},
-		"usage": map[string]any{
-			"input_tokens":          usage.PromptTokens,
-			"output_tokens":         usage.CompletionTokens,
-			"total_tokens":          usage.TotalTokens,
-			"input_tokens_details":  map[string]any{"cached_tokens": 0},
-			"output_tokens_details": map[string]any{"reasoning_tokens": usage.ReasoningTokens},
-		},
+		"usage":               responsesUsage(usage),
+		"error":               nil, "incomplete_details": nil,
+		"store": false, "previous_response_id": nil, "metadata": map[string]any{},
+	}
+	if len(choices) > 0 {
+		if choice, ok := choices[0].(map[string]any); ok {
+			if reason := incompleteReason(strOf(choice["finish_reason"])); reason != "" {
+				resp["status"] = "incomplete"
+				resp["incomplete_details"] = map[string]any{"reason": reason}
+			}
+		}
 	}
 	if reasoningText != "" {
-		resp["reasoning"] = map[string]any{"summary": reasoningText}
+		resp["reasoning"] = map[string]any{"effort": nil, "summary": "auto"}
 	}
 	return resp
 }
@@ -509,6 +563,7 @@ type responsesStreamGen struct {
 	outputIndex   int
 	textItemID    string
 	textBuf       strings.Builder
+	textItemBuf   strings.Builder
 	textOpen      bool
 	reasoningOpen bool
 	reasoningID   string
@@ -516,6 +571,9 @@ type responsesStreamGen struct {
 	toolItems     map[int]*responsesToolState
 	finishReason  string
 	output        []any
+	sequence      int
+	streamFailure error
+	customTools   map[string]bool
 }
 
 type responsesToolState struct {
@@ -525,6 +583,7 @@ type responsesToolState struct {
 	args     strings.Builder
 	index    int
 	finished bool
+	custom   bool
 }
 
 func newResponsesStreamGen(sw *sseWriter, model string) *responsesStreamGen {
@@ -540,6 +599,8 @@ func newResponsesStreamGen(sw *sseWriter, model string) *responsesStreamGen {
 
 func (g *responsesStreamGen) emit(event string, v map[string]any) {
 	v["type"] = event
+	v["sequence_number"] = g.sequence
+	g.sequence++
 	if raw := jsonEvent(v); raw != nil {
 		g.sw.event(event, raw)
 	}
@@ -554,15 +615,20 @@ func (g *responsesStreamGen) response(status string, usage Usage) map[string]any
 		"parallel_tool_calls": true,
 		"tool_choice":         "auto",
 		"tools":               []any{},
+		"error":               nil, "incomplete_details": nil,
 	}
-	if usage.TotalTokens > 0 {
-		resp["usage"] = map[string]any{
-			"input_tokens":          usage.PromptTokens,
-			"output_tokens":         usage.CompletionTokens,
-			"total_tokens":          usage.TotalTokens,
-			"input_tokens_details":  map[string]any{"cached_tokens": 0},
-			"output_tokens_details": map[string]any{"reasoning_tokens": usage.ReasoningTokens},
-		}
+	resp["usage"] = nil
+	resp["store"] = false
+	resp["previous_response_id"] = nil
+	resp["metadata"] = map[string]any{}
+	if usage.TotalTokens > 0 || usage.CacheReadTokens > 0 || usage.CacheCreationTokens > 0 {
+		resp["usage"] = responsesUsage(usage)
+	}
+	if status == "failed" && g.streamFailure != nil {
+		resp["error"] = map[string]any{"code": "upstream_stream_error", "message": g.streamFailure.Error()}
+	}
+	if status == "incomplete" {
+		resp["incomplete_details"] = map[string]any{"reason": incompleteReason(g.finishReason)}
 	}
 	return resp
 }
@@ -571,12 +637,14 @@ func (g *responsesStreamGen) created() {
 	g.emit("response.created", map[string]any{
 		"response": g.response("in_progress", Usage{}),
 	})
+	g.emit("response.in_progress", map[string]any{"response": g.response("in_progress", Usage{})})
 }
 
 func (g *responsesStreamGen) reasoning(delta string) {
 	if !g.reasoningOpen {
 		g.closeText()
 		g.reasoningOpen = true
+		g.reasoningBuf.Reset()
 		g.reasoningID = "rs_" + deepai.RandomHex(12)
 		g.emit("response.output_item.added", map[string]any{
 			"output_index": g.outputIndex,
@@ -601,6 +669,7 @@ func (g *responsesStreamGen) textDelta(delta string) {
 	if !g.textOpen {
 		g.closeReasoning()
 		g.textOpen = true
+		g.textItemBuf.Reset()
 		g.textItemID = "msg_" + deepai.RandomHex(12)
 		g.emit("response.output_item.added", map[string]any{
 			"output_index": g.outputIndex,
@@ -615,6 +684,7 @@ func (g *responsesStreamGen) textDelta(delta string) {
 		})
 	}
 	g.textBuf.WriteString(delta)
+	g.textItemBuf.WriteString(delta)
 	g.emit("response.output_text.delta", map[string]any{
 		"item_id": g.textItemID, "output_index": g.outputIndex, "content_index": 0,
 		"delta": delta,
@@ -630,15 +700,19 @@ func (g *responsesStreamGen) toolCall(idx int, id, name, args string) {
 			callID: firstString(id, "call_"+deepai.RandomHex(8)),
 			name:   name,
 			index:  g.outputIndex,
+			custom: g.customTools[name],
 		}
 		g.toolItems[idx] = state
 		g.outputIndex++
+		item := map[string]any{"id": state.itemID, "type": "function_call", "status": "in_progress", "call_id": state.callID, "name": state.name, "arguments": ""}
+		if state.custom {
+			item["type"] = "custom_tool_call"
+			delete(item, "arguments")
+			item["input"] = ""
+		}
 		g.emit("response.output_item.added", map[string]any{
 			"output_index": state.index,
-			"item": map[string]any{
-				"id": state.itemID, "type": "function_call", "status": "in_progress",
-				"call_id": state.callID, "name": state.name, "arguments": "",
-			},
+			"item":         item,
 		})
 	}
 	if name != "" && state.name == "" {
@@ -646,9 +720,11 @@ func (g *responsesStreamGen) toolCall(idx int, id, name, args string) {
 	}
 	if args != "" {
 		state.args.WriteString(args)
-		g.emit("response.function_call_arguments.delta", map[string]any{
-			"item_id": state.itemID, "output_index": state.index, "delta": args,
-		})
+		if !state.custom {
+			g.emit("response.function_call_arguments.delta", map[string]any{
+				"item_id": state.itemID, "output_index": state.index, "delta": args,
+			})
+		}
 	}
 }
 
@@ -662,10 +738,11 @@ func (g *responsesStreamGen) closeReasoning() {
 		"id": g.reasoningID, "type": "reasoning", "status": "completed",
 		"summary": []any{map[string]any{"type": "summary_text", "text": text}},
 	}
-	g.output = append(g.output, item)
+	g.setOutput(g.outputIndex, item)
 	g.emit("response.reasoning_summary_text.done", map[string]any{
 		"item_id": g.reasoningID, "output_index": g.outputIndex, "summary_index": 0, "text": text,
 	})
+	g.emit("response.reasoning_summary_part.done", map[string]any{"item_id": g.reasoningID, "output_index": g.outputIndex, "summary_index": 0, "part": map[string]any{"type": "summary_text", "text": text}})
 	g.emit("response.output_item.done", map[string]any{
 		"output_index": g.outputIndex, "item": item,
 	})
@@ -678,13 +755,13 @@ func (g *responsesStreamGen) closeText() {
 		return
 	}
 	g.textOpen = false
-	text := g.textBuf.String()
+	text := g.textItemBuf.String()
 	item := map[string]any{
 		"id": g.textItemID, "type": "message", "status": "completed",
 		"role":    "assistant",
 		"content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}},
 	}
-	g.output = append(g.output, item)
+	g.setOutput(g.outputIndex, item)
 	g.emit("response.output_text.done", map[string]any{
 		"item_id": g.textItemID, "output_index": g.outputIndex, "content_index": 0, "text": text,
 	})
@@ -699,7 +776,12 @@ func (g *responsesStreamGen) closeText() {
 }
 
 func (g *responsesStreamGen) closeTools() {
+	states := make([]*responsesToolState, 0, len(g.toolItems))
 	for _, state := range g.toolItems {
+		states = append(states, state)
+	}
+	sort.Slice(states, func(i, j int) bool { return states[i].index < states[j].index })
+	for _, state := range states {
 		if state.finished {
 			continue
 		}
@@ -709,27 +791,60 @@ func (g *responsesStreamGen) closeTools() {
 			"id": state.itemID, "type": "function_call", "status": "completed",
 			"call_id": state.callID, "name": state.name, "arguments": args,
 		}
-		g.output = append(g.output, item)
-		g.emit("response.function_call_arguments.done", map[string]any{
-			"item_id": state.itemID, "output_index": state.index, "arguments": args,
-		})
+		if state.custom {
+			input := customToolInput(args)
+			item["type"] = "custom_tool_call"
+			delete(item, "arguments")
+			item["input"] = input
+			g.emit("response.custom_tool_call_input.delta", map[string]any{"item_id": state.itemID, "output_index": state.index, "delta": input})
+			g.emit("response.custom_tool_call_input.done", map[string]any{"item_id": state.itemID, "output_index": state.index, "input": input})
+		} else {
+			g.emit("response.function_call_arguments.done", map[string]any{
+				"item_id": state.itemID, "output_index": state.index, "arguments": args,
+			})
+		}
+		g.setOutput(state.index, item)
 		g.emit("response.output_item.done", map[string]any{
 			"output_index": state.index, "item": item,
 		})
 	}
 }
 
+func (g *responsesStreamGen) setOutput(index int, item map[string]any) {
+	for len(g.output) <= index {
+		g.output = append(g.output, nil)
+	}
+	g.output[index] = item
+}
+
 func (g *responsesStreamGen) fail(err error) {
-	g.emit("error", map[string]any{"message": err.Error()})
+	g.streamFailure = err
+	g.emit("error", map[string]any{"code": "upstream_stream_error", "message": err.Error(), "param": nil})
 }
 
 func (g *responsesStreamGen) complete(usage Usage) {
 	g.closeText()
 	g.closeReasoning()
 	g.closeTools()
-	g.emit("response.completed", map[string]any{
-		"response": g.response("completed", usage),
+	status := "completed"
+	if g.streamFailure != nil {
+		status = "failed"
+	} else if incompleteReason(g.finishReason) != "" {
+		status = "incomplete"
+	}
+	g.emit("response."+status, map[string]any{
+		"response": g.response(status, usage),
 	})
+}
+
+func incompleteReason(finish string) string {
+	if finish == "length" {
+		return "max_output_tokens"
+	}
+	if finish == "content_filter" {
+		return "content_filter"
+	}
+	return ""
 }
 
 // --- 工具函数 ---

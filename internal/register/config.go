@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -21,13 +22,21 @@ const (
 
 // Config 是注册链路的运行配置。
 type Config struct {
-	TempMailBase     string
-	TempMailAdminKey string
-	TempMailDomain   string
+	TempMailBase        string
+	TempMailAdminKey    string
+	TempMailDomain      string
+	TempMailLOLBase     string
+	TempMailLOLKey      string
+	TempMailLOLTokenDir string
+	QQIMAPHost          string
+	QQIMAPPort          int
+	QQIMAPUser          string
+	QQIMAPAuthCode      string
+	QQIMAPFolder        string
 
 	// DefaultDomain 是静态邮箱后端使用的域名。
 	DefaultDomain string
-	// MailBackend 为 cf / static / none；空串表示自动选择。
+	// MailBackend 为 cf / qqimap / tempmail_lol / static / none；空串表示自动选择。
 	MailBackend string
 
 	Gateway       string
@@ -53,24 +62,32 @@ func LoadConfig() *Config {
 	loadEnvFiles()
 
 	cfg := &Config{
-		TempMailBase:     strings.TrimRight(env("TEMPMAIL_BASE"), "/"),
-		TempMailAdminKey: env("TEMPMAIL_ADMIN_KEY"),
-		TempMailDomain:   env("TEMPMAIL_DOMAIN"),
-		DefaultDomain:    firstNonEmpty(env("DEEPAI_REGISTER_DOMAIN"), env("TEMPMAIL_DOMAIN")),
-		MailBackend:      strings.ToLower(env("DEEPAI_REGISTER_MAIL_BACKEND")),
-		Gateway:          firstNonEmpty(env("DEEPAI2API_GATEWAY"), DefaultGateway),
-		AdminPassword:    env("DEEPAI2API_ADMIN_PASSWORD"),
-		Proxy:            env("DEEPAI_REGISTER_PROXY"),
-		ProxyPool:        firstNonEmpty(env("PROXY_POOL"), env("DEEPAI_REGISTER_PROXY_POOL")),
-		ProxyFile:        env("PROXY_POOL_FILE"),
-		Language:         firstNonEmpty(env("DEEPAI_REGISTER_LANGUAGE"), DefaultLanguage),
-		UserAgent:        firstNonEmpty(env("DEEPAI_REGISTER_UA"), DefaultUserAgent),
-		VerifyWait:       DefaultVerifyWait,
-		PollEvery:        DefaultPollEvery,
-		MinInterval:      DefaultMinInterval,
-		ProbeModel:       firstNonEmpty(env("DEEPAI_REGISTER_PROBE_MODEL"), DefaultProbeModel),
-		DefaultGroup:     firstNonEmpty(env("DEEPAI_REGISTER_GROUP"), "default"),
-		DefaultPrefix:    firstNonEmpty(env("DEEPAI_REGISTER_PREFIX"), "dai"),
+		TempMailBase:        strings.TrimRight(env("TEMPMAIL_BASE"), "/"),
+		TempMailAdminKey:    env("TEMPMAIL_ADMIN_KEY"),
+		TempMailDomain:      env("TEMPMAIL_DOMAIN"),
+		TempMailLOLBase:     firstNonEmpty(env("TEMPMAIL_LOL_BASE"), "https://api.tempmail.lol/v2"),
+		TempMailLOLKey:      env("TEMPMAIL_LOL_API_KEY"),
+		TempMailLOLTokenDir: env("TEMPMAIL_LOL_TOKEN_DIR"),
+		QQIMAPHost:          firstNonEmpty(env("QQ_IMAP_HOST"), "imap.qq.com"),
+		QQIMAPPort:          qqIMAPPortFromEnv(),
+		QQIMAPUser:          env("QQ_IMAP_USER"),
+		QQIMAPAuthCode:      env("QQ_IMAP_AUTH_CODE"),
+		QQIMAPFolder:        firstNonEmpty(env("QQ_IMAP_FOLDER"), "INBOX"),
+		DefaultDomain:       firstNonEmpty(env("DEEPAI_REGISTER_DOMAIN"), env("TEMPMAIL_DOMAIN")),
+		MailBackend:         strings.ToLower(env("DEEPAI_REGISTER_MAIL_BACKEND")),
+		Gateway:             firstNonEmpty(env("DEEPAI2API_GATEWAY"), DefaultGateway),
+		AdminPassword:       env("DEEPAI2API_ADMIN_PASSWORD"),
+		Proxy:               env("DEEPAI_REGISTER_PROXY"),
+		ProxyPool:           firstNonEmpty(env("PROXY_POOL"), env("DEEPAI_REGISTER_PROXY_POOL")),
+		ProxyFile:           env("PROXY_POOL_FILE"),
+		Language:            firstNonEmpty(env("DEEPAI_REGISTER_LANGUAGE"), DefaultLanguage),
+		UserAgent:           firstNonEmpty(env("DEEPAI_REGISTER_UA"), DefaultUserAgent),
+		VerifyWait:          DefaultVerifyWait,
+		PollEvery:           DefaultPollEvery,
+		MinInterval:         DefaultMinInterval,
+		ProbeModel:          firstNonEmpty(env("DEEPAI_REGISTER_PROBE_MODEL"), DefaultProbeModel),
+		DefaultGroup:        firstNonEmpty(env("DEEPAI_REGISTER_GROUP"), "default"),
+		DefaultPrefix:       firstNonEmpty(env("DEEPAI_REGISTER_PREFIX"), "dai"),
 	}
 	return cfg
 }
@@ -82,6 +99,12 @@ func (c *Config) AutoBackend() string {
 	}
 	if c.TempMailBase != "" && c.TempMailAdminKey != "" {
 		return "cf"
+	}
+	if c.QQIMAPUser != "" && c.QQIMAPAuthCode != "" {
+		return "qqimap"
+	}
+	if c.TempMailLOLKey != "" {
+		return "tempmail_lol"
 	}
 	if c.DefaultDomain != "" {
 		return "static"
@@ -107,8 +130,29 @@ func (c *Config) Validate(backend string) []string {
 		if c.DefaultDomain == "" {
 			missing = append(missing, "DEEPAI_REGISTER_DOMAIN")
 		}
+	case "qqimap":
+		if c.DefaultDomain == "" {
+			missing = append(missing, "DEEPAI_REGISTER_DOMAIN（注册邮箱域名）")
+		}
+		if c.QQIMAPUser == "" {
+			missing = append(missing, "QQ_IMAP_USER（QQ 邮箱）")
+		}
+		if c.QQIMAPAuthCode == "" {
+			missing = append(missing, "QQ_IMAP_AUTH_CODE（IMAP 授权码）")
+		}
 	}
 	return missing
+}
+
+func qqIMAPPortFromEnv() int {
+	if value := env("QQ_IMAP_PORT"); value != "" {
+		port, err := strconv.Atoi(value)
+		if err != nil || port < 1 || port > 65535 {
+			return -1 // NewProvider reports an invalid port instead of silently using a default.
+		}
+		return port
+	}
+	return 993
 }
 
 // loadEnvFiles 按优先级加载 .env；真实环境变量优先。

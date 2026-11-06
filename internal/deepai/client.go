@@ -14,6 +14,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"deepaicode2api/internal/proxychain"
 )
 
 // maxJSONBytes 限制上游 JSON 响应体大小（模型目录 / 配额 / 搜索）。
@@ -192,9 +194,12 @@ func NewClientWithFingerprint(proxyRaw, userAgent string) *Client {
 		ForceAttemptHTTP2:     true,
 	}
 	proxyRaw = strings.TrimSpace(proxyRaw)
+	var explicitProxy *url.URL
 	if proxyRaw != "" {
 		if u, err := url.Parse(proxyRaw); err == nil && u.Host != "" {
+			explicitProxy = u
 			transport.Proxy = http.ProxyURL(u)
+			proxychain.Configure(transport, u)
 		}
 	}
 	return &Client{
@@ -203,7 +208,7 @@ func NewClientWithFingerprint(proxyRaw, userAgent string) *Client {
 		UserAgent: strings.TrimSpace(userAgent),
 		Proxy:     proxyRaw,
 		HTTP: &http.Client{
-			Transport: transport,
+			Transport: proxychain.WithDirectFallback(transport, explicitProxy),
 			// 上游会 302 跳到登录页，跟随只会掩盖鉴权失败。
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},

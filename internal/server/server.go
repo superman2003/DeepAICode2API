@@ -18,20 +18,27 @@ import (
 	"deepaicode2api/internal/deepai"
 	"deepaicode2api/internal/registry"
 	"deepaicode2api/internal/store"
+	"deepaicode2api/internal/updater"
 )
 
 // Server 是网关 HTTP 服务。
 type Server struct {
-	Store *store.Store
-	Up    *deepai.Client
+	Store         *store.Store
+	Version       string
+	Updater       *updater.Manager
+	maintenanceMu sync.Mutex
+	updating      bool
+	Up            *deepai.Client
 	// Login 保存进行中的浏览器登录会话（内存态）。
 	Login *loginSessions
 	// Registers 保存批量注册任务（内存态）。
 	Registers *registerJobs
 
-	refreshMu    sync.Mutex
-	proxyMu      sync.Mutex
-	proxyClients map[string]*deepai.Client
+	refreshMu       sync.Mutex
+	proxyMu         sync.Mutex
+	proxyClients    map[string]*deepai.Client
+	sessionMu       sync.Mutex
+	sessionAccounts map[string]sessionAccountBinding
 
 	// quotaReprobeDelays 是入池后 0 额度的复探退避序列（测试可注入短值）。
 	quotaReprobeDelays []time.Duration
@@ -41,7 +48,7 @@ type Server struct {
 func New(st *store.Store) *Server {
 	return &Server{
 		Store: st, Up: deepai.NewClient(), Login: newLoginSessions(),
-		Registers: newRegisterJobs(), proxyClients: map[string]*deepai.Client{},
+		Registers: newRegisterJobs(), proxyClients: map[string]*deepai.Client{}, sessionAccounts: map[string]sessionAccountBinding{},
 		quotaReprobeDelays: quotaReprobeDelays,
 	}
 }
@@ -93,6 +100,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/admin/api/login/start", s.withAdminAuth(s.handleLoginStart))
 	mux.HandleFunc("/admin/api/login/poll", s.withAdminAuth(s.handleLoginPoll))
 	mux.HandleFunc("/admin/api/register", s.withAdminAuth(s.handleAdminRegister))
+	mux.HandleFunc("/admin/api/register/mailbox-test", s.withAdminAuth(s.handleAdminMailboxTest))
+	mux.HandleFunc("/admin/api/update", s.withAdminAuth(s.handleAdminUpdate))
 	// 浏览器登录跳转：session id 是一次性随机数，服务端只跳到固定的上游登录页。
 	mux.HandleFunc("/login/open", s.handleLoginOpen)
 
@@ -143,7 +152,7 @@ func writeCORSHeaders(w http.ResponseWriter, allowed string) {
 	h := w.Header()
 	h.Set("Access-Control-Allow-Origin", allowed)
 	h.Set("Vary", "Origin")
-	h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, x-api-key, anthropic-version, anthropic-beta, X-Admin-Password, X-Session-Affinity")
+	h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, x-api-key, anthropic-version, anthropic-beta, X-Admin-Password, X-Session-Affinity, session_id, x-codex-session-id, x-session-id")
 	h.Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 	h.Set("Access-Control-Expose-Headers", "X-Request-Id, Retry-After")
 }
@@ -218,6 +227,7 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, http.StatusUnauthorized, "API 密钥无效或已停用", "invalid_request_error")
 			return
 		}
+		r = r.WithContext(context.WithValue(r.Context(), clientKeyContext{}, deepai.KeyFingerprint(key)))
 		next(w, r)
 	}
 }
@@ -357,6 +367,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":        "ok",
+		"version":       s.Version,
 		"accounts":      len(accts),
 		"ready":         ok,
 		"models":        len(models),
@@ -443,15 +454,17 @@ func (s *Server) handleAdminState(w http.ResponseWriter, r *http.Request) {
 		catalog = []deepai.Model{deepai.DefaultModelEntry()}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"accounts":       safe,
-		"keys":           safeKeys,
-		"models":         registry.List(catalog, s.Store.Settings().ModelAliases),
-		"default_model":  s.Store.DefaultModel(),
-		"models_updated": s.Store.ModelsUpdated(),
-		"machine_id":     shortMachine(s.Store.MachineID()),
-		"settings":       sanitizedSettings(s.Store.Settings()),
-		"stats":          s.Store.Stats(),
-		"upstream":       s.Up.Origin,
+		"accounts":               safe,
+		"keys":                   safeKeys,
+		"models":                 registry.List(catalog, s.Store.Settings().ModelAliases),
+		"default_model":          s.Store.DefaultModel(),
+		"models_updated":         s.Store.ModelsUpdated(),
+		"machine_id":             shortMachine(s.Store.MachineID()),
+		"settings":               sanitizedSettings(s.Store.Settings()),
+		"stats":                  s.Store.Stats(),
+		"upstream":               s.Up.Origin,
+		"registration_max_count": registrationMaxCount(),
+		"version":                s.Version,
 	})
 }
 

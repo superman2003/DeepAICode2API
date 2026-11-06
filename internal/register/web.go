@@ -13,6 +13,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"deepaicode2api/internal/proxychain"
 )
 
 // DeepAI 网页端 API 源。
@@ -90,9 +92,12 @@ func NewWebClientWithFingerprint(cfg *Config, fp Fingerprint, proxy string) *Web
 		ForceAttemptHTTP2:     true,
 	}
 	proxy = strings.TrimSpace(proxy)
+	var explicitProxy *url.URL
 	if proxy != "" {
 		if u, err := url.Parse(proxy); err == nil && u.Host != "" {
+			explicitProxy = u
 			transport.Proxy = http.ProxyURL(u)
+			proxychain.Configure(transport, u)
 		}
 	}
 	ua := fp.UserAgent
@@ -112,7 +117,7 @@ func NewWebClientWithFingerprint(cfg *Config, fp Fingerprint, proxy string) *Web
 		Proxy:       proxy,
 		Jar:         jar,
 		HTTP: &http.Client{
-			Transport: transport,
+			Transport: proxychain.WithDirectFallback(transport, explicitProxy),
 			Jar:       jar,
 			Timeout:   60 * time.Second,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {

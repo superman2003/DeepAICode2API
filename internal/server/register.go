@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,6 +17,17 @@ import (
 	"deepaicode2api/internal/deepai"
 	"deepaicode2api/internal/register"
 )
+
+func registrationMaxCount() int {
+	value, err := strconv.Atoi(strings.TrimSpace(os.Getenv("DEEPAI2API_REGISTER_MAX_COUNT")))
+	if err != nil || value < 1 {
+		return 1000
+	}
+	if value > 10000 {
+		return 10000
+	}
+	return value
+}
 
 // registerJob 是一次批量注册任务的运行状态。
 type registerJob struct {
@@ -197,14 +209,102 @@ func (s *Server) handleAdminRegister(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// Mailbox credentials are request-scoped; never include them in job snapshots.
+type mailboxConfigRequest struct {
+	Domain         string `json:"domain"`
+	MailBackend    string `json:"mail_backend"`
+	QQIMAPHost     string `json:"qq_imap_host"`
+	QQIMAPPort     int    `json:"qq_imap_port"`
+	QQIMAPUser     string `json:"qq_imap_user"`
+	QQIMAPAuthCode string `json:"qq_imap_auth_code"`
+	QQIMAPFolder   string `json:"qq_imap_folder"`
+	TempMailLOLKey string `json:"tempmail_lol_api_key"`
+}
+
+func (b mailboxConfigRequest) apply(cfg *register.Config) {
+	if b.Domain != "" {
+		cfg.DefaultDomain = strings.TrimSpace(b.Domain)
+	}
+	if b.MailBackend != "" {
+		cfg.MailBackend = strings.ToLower(strings.TrimSpace(b.MailBackend))
+	}
+	if b.QQIMAPHost != "" {
+		cfg.QQIMAPHost = strings.TrimSpace(b.QQIMAPHost)
+	}
+	if b.QQIMAPPort != 0 {
+		cfg.QQIMAPPort = b.QQIMAPPort
+	}
+	if b.QQIMAPUser != "" {
+		cfg.QQIMAPUser = strings.TrimSpace(b.QQIMAPUser)
+	}
+	if b.QQIMAPAuthCode != "" {
+		cfg.QQIMAPAuthCode = strings.TrimSpace(b.QQIMAPAuthCode)
+	}
+	if b.QQIMAPFolder != "" {
+		cfg.QQIMAPFolder = strings.TrimSpace(b.QQIMAPFolder)
+	}
+	if b.TempMailLOLKey != "" {
+		cfg.TempMailLOLKey = strings.TrimSpace(b.TempMailLOLKey)
+	}
+	if strings.EqualFold(strings.TrimSpace(b.MailBackend), "tempmail_lol") {
+		cfg.DefaultDomain = strings.TrimSpace(b.Domain) // Empty means random; do not inherit a QQ domain.
+	}
+}
+
+func (s *Server) mailboxConfig(body mailboxConfigRequest) *register.Config {
+	cfg := register.LoadConfig()
+	body.apply(cfg)
+	if cfg.TempMailLOLTokenDir == "" {
+		cfg.TempMailLOLTokenDir = filepath.Join(filepath.Dir(s.Store.Path()), "exports", "tempmail-lol-inboxes")
+	}
+	return cfg
+}
+
+func (s *Server) handleAdminMailboxTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "仅支持 POST", "invalid_request_error")
+		return
+	}
+	var body mailboxConfigRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体解析失败", "invalid_request_error")
+		return
+	}
+	cfg := s.mailboxConfig(body)
+	if body.MailBackend == "" {
+		cfg.MailBackend = "qqimap"
+	}
+	backend := cfg.AutoBackend()
+	if missing := cfg.Validate(backend); len(missing) > 0 {
+		writeErr(w, http.StatusBadRequest, "邮箱配置不完整："+strings.Join(missing, ", "), "invalid_request_error")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	if err := register.CheckProvider(ctx, cfg, backend, cfg.DefaultDomain); err != nil {
+		writeErr(w, http.StatusBadRequest, "邮箱连接测试失败："+err.Error(), "mailbox_error")
+		return
+	}
+	message := "邮箱登录和收件文件夹检查通过；请确认域名邮件已转发到此邮箱。"
+	if backend == "tempmail_lol" {
+		message = "TempMail.lol 配置检查通过；开始注册时会创建邮箱并验证 API 权限。"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": message})
+}
+
 func (s *Server) startRegisterJob(w http.ResponseWriter, r *http.Request) {
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	if s.updating {
+		writeErr(w, http.StatusServiceUnavailable, "程序正在升级，请完成后再开始注册", "updating")
+		return
+	}
 	var body struct {
+		mailboxConfigRequest
 		Count         int    `json:"count"`
 		Concurrency   int    `json:"concurrency"`
 		Email         string `json:"email"`
 		Password      string `json:"password"`
-		Domain        string `json:"domain"`
-		MailBackend   string `json:"mail_backend"`
 		Group         string `json:"group"`
 		Verify        *bool  `json:"verify"`
 		Proxy         string `json:"proxy"`
@@ -218,8 +318,8 @@ func (s *Server) startRegisterJob(w http.ResponseWriter, r *http.Request) {
 	if body.Count <= 0 {
 		body.Count = 1
 	}
-	if body.Count > 50 {
-		writeErr(w, http.StatusBadRequest, "单次最多注册 50 个账号", "invalid_request_error")
+	if maximum := registrationMaxCount(); body.Count > maximum {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("单次最多注册 %d 个账号", maximum), "invalid_request_error")
 		return
 	}
 	if body.Concurrency <= 0 {
@@ -241,13 +341,7 @@ func (s *Server) startRegisterJob(w http.ResponseWriter, r *http.Request) {
 		group = "default"
 	}
 
-	cfg := register.LoadConfig()
-	if body.Domain != "" {
-		cfg.DefaultDomain = strings.TrimSpace(body.Domain)
-	}
-	if body.MailBackend != "" {
-		cfg.MailBackend = strings.ToLower(strings.TrimSpace(body.MailBackend))
-	}
+	cfg := s.mailboxConfig(body.mailboxConfigRequest)
 	if body.Proxy != "" {
 		cfg.Proxy = strings.TrimSpace(body.Proxy)
 	}
@@ -268,7 +362,7 @@ func (s *Server) startRegisterJob(w http.ResponseWriter, r *http.Request) {
 	backend := cfg.AutoBackend()
 	if missing := cfg.Validate(backend); len(missing) > 0 {
 		writeErr(w, http.StatusBadRequest,
-			fmt.Sprintf("邮箱后端 %s 缺少配置：%s（请在 .env / 环境变量中填写）", backend, strings.Join(missing, ", ")),
+			fmt.Sprintf("邮箱后端 %s 缺少配置：%s（请在注册页面或 .env 中填写）", backend, strings.Join(missing, ", ")),
 			"invalid_request_error")
 		return
 	}
@@ -281,6 +375,12 @@ func (s *Server) startRegisterJob(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "初始化邮箱后端失败: "+err.Error(), "invalid_request_error")
 		return
+	}
+	if backend == "qqimap" && verify {
+		if err := provider.(register.HealthProvider).Health(r.Context()); err != nil {
+			writeErr(w, http.StatusBadRequest, "注册前邮箱检查失败："+err.Error(), "mailbox_error")
+			return
+		}
 	}
 
 	jobID := deepai.RandomHex(8)
@@ -385,19 +485,24 @@ func (s *Server) enrollRecord(rec *register.Record) (string, error) {
 		return "", errors.New("空记录")
 	}
 	reg := deepai.Registration{
-		Email:         rec.Email,
-		Password:      rec.Password,
-		Username:      rec.Username,
-		APIKey:        rec.APIKey,
-		SessionID:     rec.SessionID,
-		CSRFToken:     rec.CSRFToken,
-		UserPK:        rec.UserPK,
-		Plan:          rec.Plan,
-		EmailVerified: rec.EmailVerified,
-		Group:         rec.Group,
-		Proxy:         rec.Proxy,
-		Fingerprint:   rec.Fingerprint,
-		Source:        "register",
+		Email:          rec.Email,
+		Password:       rec.Password,
+		Username:       rec.Username,
+		APIKey:         rec.APIKey,
+		SessionID:      rec.SessionID,
+		CSRFToken:      rec.CSRFToken,
+		UserPK:         rec.UserPK,
+		Plan:           rec.Plan,
+		EmailVerified:  rec.EmailVerified,
+		Group:          rec.Group,
+		Proxy:          rec.Proxy,
+		Fingerprint:    rec.Fingerprint,
+		MachineID:      rec.MachineID,
+		UserAgent:      rec.UserAgent,
+		AcceptLanguage: rec.AcceptLanguage,
+		SecCHUA:        rec.SecCHUA,
+		Platform:       rec.Platform,
+		Source:         "register",
 	}
 	id, _, err := s.enrollRegistration(reg, &deepai.Allowance{
 		Enabled:   true,
