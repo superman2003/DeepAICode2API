@@ -125,7 +125,7 @@ func TestCodexCustomToolRoundTrip(t *testing.T) {
 			}
 			up := u.last(t).Payload
 			messages := up["messages"].([]any)
-			if len(messages) != 3 || messages[1].(map[string]any)["role"] != "tool" {
+			if len(messages) != 4 || messages[0].(map[string]any)["role"] != "system" || messages[2].(map[string]any)["role"] != "tool" {
 				t.Fatal("custom tool history was dropped")
 			}
 			parameters := up["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)["parameters"].(map[string]any)

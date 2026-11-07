@@ -335,13 +335,13 @@ func asHTTPError(err error, target **HTTPError) bool {
 	return ok
 }
 
-func TestJSONBodyIsVerbatim(t *testing.T) {
+func TestJSONBodyWithInstructionsIsVerbatim(t *testing.T) {
 	var got []byte
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		got, _ = io.ReadAll(r.Body)
 		_, _ = io.WriteString(w, `{}`)
 	})
-	body := []byte(`{"model":"x","messages":[{"role":"user","content":"你好"}]}`)
+	body := []byte(`{"model":"x","messages":[{"role":"system","content":"Follow caller instructions."},{"role":"user","content":"你好"}]}`)
 	if _, err := c.OpenModel(context.Background(), &Account{APIKey: "k"}, PathChat, body, ""); err != nil {
 		t.Fatalf("OpenModel: %v", err)
 	}

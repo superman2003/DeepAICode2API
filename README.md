@@ -59,7 +59,7 @@ DeepAI Code 是 **Electron + 本地 t3code server** 架构（应用版本 0.3.17
 | 语音转写 | `POST https://api.deepai.org/speech_to_text`（字段 `voiceRecording`） |
 | 联网搜索 | `POST https://api.deepai.org/deepai_code/web_search` |
 | **鉴权** | 请求头 `Api-Key: <apiKey>`（不是 `Authorization`） |
-| 协议头 | `X-DeepAI-Code-Theos: 2`（计费车道版本） |
+| 协议头 | `X-DeepAI-Code-Theos: 4`（对齐官方 0.3.19，含进程实例与 check-in） |
 | **机器指纹** | `X-DeepAI-Code-Machine: sha256(原始机器 UUID)`，用于按天发放免费 Theos |
 | 会话粘性 | `X-Session-Affinity`（body 里的 `prompt_cache_key` 也会被上游使用） |
 | 容量拒绝 | `409 {"error":{"code":"session_busy"}}` + `Retry-After` |

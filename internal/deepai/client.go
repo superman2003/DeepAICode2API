@@ -166,6 +166,7 @@ type Client struct {
 	Machine   string
 	UserAgent string
 	Proxy     string
+	protocol  *laneProtocol
 }
 
 // NewClient 构造上游客户端（默认读取环境代理）。
@@ -207,6 +208,7 @@ func NewClientWithFingerprint(proxyRaw, userAgent string) *Client {
 		Machine:   MachineID(),
 		UserAgent: strings.TrimSpace(userAgent),
 		Proxy:     proxyRaw,
+		protocol:  processLaneProtocol,
 		HTTP: &http.Client{
 			Transport: proxychain.WithDirectFallback(transport, explicitProxy),
 			// 上游会 302 跳到登录页，跟随只会掩盖鉴权失败。
@@ -232,7 +234,8 @@ func (c *Client) SignInURL(state string, port int) string {
 
 // commonHeaders 写入所有上游请求的公共头。
 func (c *Client) commonHeaders(req *http.Request, acct *Account) {
-	req.Header.Set("X-DeepAI-Code-Theos", LaneVersion)
+	req.Header.Set(HeaderLane, LaneVersion)
+	req.Header.Set(HeaderInstance, c.laneProtocol().instance)
 	// 机器指纹优先取账号级：上游按它发放每日免费额度，共用会互相抵消。
 	machine := c.Machine
 	if acct != nil && acct.MachineID != "" {
@@ -330,6 +333,10 @@ func (c *Client) FetchModels(ctx context.Context) ([]Model, string, error) {
 // path 取 PathChat 或 PathResponses；affinity 会作为 X-Session-Affinity
 // 透传（上游据此做会话粘性调度）。
 func (c *Client) OpenModel(ctx context.Context, acct *Account, path string, body []byte, affinity string) (*http.Response, error) {
+	if path == PathChat {
+		body = normalizeChatInstructions(body)
+	}
+	c.checkInBeforeModel(ctx, acct)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ModelURL(path), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -344,11 +351,19 @@ func (c *Client) OpenModel(ctx context.Context, acct *Account, path string, body
 
 // Theos 查询账号的免费额度 / 余额。
 func (c *Client) Theos(ctx context.Context, acct *Account) (*Allowance, error) {
+	state := c.checkInState(acct)
+	select {
+	case state.gate <- struct{}{}:
+		defer func() { <-state.gate }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.ModelURL(PathTheos), nil)
 	if err != nil {
 		return nil, err
 	}
 	c.commonHeaders(req, acct)
+	c.checkInHeaders(req, state)
 
 	resp, err := c.do(req)
 	if err != nil {
@@ -359,6 +374,8 @@ func (c *Client) Theos(ctx context.Context, acct *Account) (*Allowance, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Lane 4 can rotate the next nonce on both successful and refused check-ins.
+	state.note(body, time.Now())
 	if resp.StatusCode/100 != 2 {
 		return nil, &HTTPError{Op: "查询 Theos", Status: resp.StatusCode, Body: body}
 	}

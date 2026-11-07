@@ -130,11 +130,11 @@ func TestResponsesStringInput(t *testing.T) {
 		t.Fatalf("状态码 = %d：%s", rec.Code, rec.Body.String())
 	}
 	msgs, _ := u.last(t).Payload["messages"].([]any)
-	if len(msgs) != 1 {
-		t.Fatalf("消息数 = %d，期望 1: %#v", len(msgs), msgs)
+	if len(msgs) != 2 || msgs[0].(map[string]any)["role"] != "system" {
+		t.Fatalf("应包含前导 system 和字符串 input: %#v", msgs)
 	}
-	if msgs[0].(map[string]any)["content"] != "直接给字符串" {
-		t.Fatalf("字符串 input 未映射: %#v", msgs[0])
+	if msgs[1].(map[string]any)["content"] != "直接给字符串" {
+		t.Fatalf("字符串 input 未映射: %#v", msgs[1])
 	}
 }
 

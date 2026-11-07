@@ -150,15 +150,8 @@ func main() {
 		srv.Updater = manager
 	}
 
-	// A migrated server already has a catalog. Fast startup uses that cache
-	// immediately; the existing periodic refresh remains active.
-	if envBool("DEEPAI2API_FAST_START", false) && len(st.Models()) > 0 {
-		log.Printf("快速启动：使用已保存的 %d 个模型，启动阶段不等待外网", len(st.Models()))
-	} else if models, err := srv.RefreshModels(context.Background()); err != nil {
-		log.Printf("拉取模型目录失败（沿用缓存）: %v", err)
-	} else {
-		log.Printf("模型目录已更新：%d 个模型，默认 %s", len(models), st.DefaultModel())
-	}
+	// Backport upstream b0ec437: external catalog fetches never delay the
+	// listener or updater health checks. Refresh the cache in background.
 
 	addr := net.JoinHostPort(*host, fmt.Sprintf("%d", *port))
 	httpSrv := &http.Server{
@@ -222,6 +215,13 @@ func main() {
 
 // background 负责定期持久化与模型目录刷新。
 func background(st *store.Store, srv *server.Server, stop <-chan struct{}) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if models, err := srv.RefreshModels(ctx); err != nil {
+		log.Printf("拉取模型目录失败（沿用缓存）: %v", err)
+	} else {
+		log.Printf("模型目录已更新：%d 个模型，默认 %s", len(models), st.DefaultModel())
+	}
+	cancel()
 	saveTick := time.NewTicker(30 * time.Second)
 	defer saveTick.Stop()
 	modelTick := time.NewTicker(6 * time.Hour)

@@ -343,10 +343,10 @@ func TestAnthropicToolResultBecomesToolRole(t *testing.T) {
 	}
 
 	msgs, _ := u.last(t).Payload["messages"].([]any)
-	if len(msgs) != 2 {
-		t.Fatalf("消息数 = %d，期望 2: %#v", len(msgs), msgs)
+	if len(msgs) != 3 || msgs[0].(map[string]any)["role"] != "system" {
+		t.Fatalf("应包含前导 system 和两个工具历史消息: %#v", msgs)
 	}
-	asst := msgs[0].(map[string]any)
+	asst := msgs[1].(map[string]any)
 	if asst["role"] != "assistant" || asst["content"] != "好的" {
 		t.Fatalf("assistant 消息错误: %#v", asst)
 	}
@@ -357,7 +357,7 @@ func TestAnthropicToolResultBecomesToolRole(t *testing.T) {
 	if got := calls[0].(map[string]any)["function"].(map[string]any)["arguments"]; got != `{"city":"SH"}` {
 		t.Fatalf("工具参数序列化错误: %v", got)
 	}
-	tool := msgs[1].(map[string]any)
+	tool := msgs[2].(map[string]any)
 	if tool["role"] != "tool" || tool["tool_call_id"] != "call_1" || tool["content"] != "晴 30℃" {
 		t.Fatalf("tool_result 映射错误: %#v", tool)
 	}

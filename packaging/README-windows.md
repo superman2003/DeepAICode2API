@@ -23,4 +23,5 @@
 需要使用本包的 `run-windows.cmd` 启动；直接启动裸 exe 或旧启动脚本不能执行网页重启。
 
 TempMail.lol、Claude Code、Codex 和注册上限的说明见 `docs/claude-codex.md` 与 `docs/tempmail-lol.md`。
+`v0.2.2` 起对齐官方 0.3.19 的协议 4，修复旧协议 426 与缺省指令请求被拒绝的问题，见 `docs/protocol-v4.md`。
 自定义源码后可安装 Go 1.25+，运行启动脚本时加 `-Build` 编译。
